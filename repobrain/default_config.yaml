@@ -1,0 +1,45 @@
+# RepoBrain default configuration.
+# Override any of these via a project-local `repobrain.yaml` (pass with --config)
+# or via CLI flags. CLI flags always win over file config.
+
+# Which languages to analyze. Each entry must have a registered parser
+# in repobrain.parsing.registry.
+languages:
+  - java
+
+# Directories/files skipped in addition to .gitignore rules.
+exclude_patterns:
+  - "**/build/**"
+  - "**/target/**"
+  - "**/.git/**"
+  - "**/node_modules/**"
+  - "**/*.min.js"
+  - ".repobrain/**"
+
+# Where generated documentation files are written, relative to the
+# repository root being analyzed.
+output_dir: "docs/generated"
+
+docs:
+  - README.md
+  - ARCHITECTURE.md
+  - SEQUENCE.md
+
+llm:
+  provider: ollama
+  model: qwen3:8b
+  host: "http://localhost:11434"
+  temperature: 0.2
+  num_ctx: 8192
+  timeout_seconds: 600
+  # "/no_think" is appended for Qwen3-style models to skip the
+  # <think> reasoning trace in output; harmless for other models.
+  suppress_thinking: true
+
+# Local state used for incremental documentation updates
+# (file hashes, last-processed commit, cached IR).
+state_dir: ".repobrain"
+
+logging:
+  level: INFO
+  file: null  # set to a path to also log to file
