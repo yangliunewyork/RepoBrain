@@ -13,6 +13,7 @@ import re
 from dataclasses import dataclass, field
 
 from repobrain.analysis.call_graph import CallEdge, build_call_graph, group_by_caller
+from repobrain.analysis.layers import Layer, classify_layer, layer_rank
 from repobrain.analysis.symbol_extractor import SymbolIndex
 from repobrain.ir.models import RepoIR
 
@@ -27,25 +28,23 @@ MAX_DEPTH = 4
 
 EntryKey = tuple[str, str]  # (caller_class qualified name, method name)
 
-#: Keyword-based layer classification, used only to order participants
-#: left-to-right in the rendered diagram (API -> service -> data) —
-#: matched against the lowercased package + class qualified name.
-#: Checked in this order, so a name matching more than one tier resolves
-#: to the earliest (leftmost) one.
-_API_LAYER_KEYWORDS = ("controller", "endpoint", "resource", "router", "api", "rest", "web")
-_DATA_LAYER_KEYWORDS = ("repository", "repo", "dao", "persistence", "database", "mapper", "entity", "store")
-#: Everything else (services, domain/model classes, utilities, ...)
-#: defaults to this middle rank rather than being pinned to an edge.
-_DEFAULT_LAYER_RANK = 1
+#: Method-level annotations marking a definite application entry point
+#: (an HTTP route, RPC handler, ...) rather than just "public and nothing
+#: else calls it." When present, these methods are preferred as flow
+#: starting points over the generic heuristic below — the annotation
+#: *is* the entry point, not a proxy for one.
+_ROUTE_ANNOTATIONS = {
+    "GetMapping", "PostMapping", "PutMapping", "DeleteMapping", "PatchMapping",
+    "RequestMapping", "GET", "POST", "PUT", "DELETE", "PATCH",  # JAX-RS
+}
 
-
-def _layer_rank(qualified_name: str) -> int:
-    lowered = qualified_name.lower()
-    if any(k in lowered for k in _API_LAYER_KEYWORDS):
-        return 0
-    if any(k in lowered for k in _DATA_LAYER_KEYWORDS):
-        return 2
-    return _DEFAULT_LAYER_RANK
+#: Method-level annotations marking test code, excluded from entry-point
+#: candidacy even if a test file slips past the default exclude_patterns
+#: (non-standard layout, generated sources, ...). File-level exclusion is
+#: the primary defense (see default_config.yaml); this is a second layer
+#: — without it, a `@Test` method that calls several services and isn't
+#: itself called by anything else looks exactly like a real entry point.
+_TEST_ANNOTATIONS = {"Test", "ParameterizedTest", "RepeatedTest", "TestFactory"}
 
 
 @dataclass
@@ -65,17 +64,19 @@ class SequenceFlow:
 
 
 def _is_entry_candidate(class_info, method) -> bool:
-    return (
-        not method.is_constructor
-        and "public" in method.modifiers
-        and "public" in class_info.modifiers
-    )
+    if method.is_constructor:
+        return False
+    if "public" not in method.modifiers or "public" not in class_info.modifiers:
+        return False
+    if set(method.annotations) & _TEST_ANNOTATIONS:
+        return False
+    return True
 
 
 def _select_entry_points(repo_ir: RepoIR, grouped: dict[EntryKey, list[CallEdge]]) -> list[EntryKey]:
     called_targets = {(e.callee_class, e.callee_method) for edges in grouped.values() for e in edges}
 
-    candidates: list[tuple[EntryKey, int, bool]] = []
+    candidates: list[tuple[EntryKey, int, bool, bool]] = []
     for file_ir in repo_ir.files.values():
         for class_info in file_ir.iter_classes():
             for method in class_info.methods:
@@ -86,13 +87,15 @@ def _select_entry_points(repo_ir: RepoIR, grouped: dict[EntryKey, list[CallEdge]
                 if not outgoing:
                     continue
                 is_pure_entry = key not in called_targets
-                candidates.append((key, len(outgoing), is_pure_entry))
+                has_route_annotation = bool(set(method.annotations) & _ROUTE_ANNOTATIONS)
+                candidates.append((key, len(outgoing), is_pure_entry, has_route_annotation))
 
-    # Prefer methods nothing else in the repo calls (likely real entry
-    # points: controllers, CLI commands, public API surface) with the
-    # most outgoing calls; sort by key too so selection is deterministic
-    # for fingerprinting.
-    candidates.sort(key=lambda c: (not c[2], -c[1], c[0]))
+    # Prefer, in order: (1) a verified route/handler annotation -- not a
+    # guess, an actual framework-recognized entry point; (2) methods
+    # nothing else in the repo calls (likely real entry points otherwise:
+    # CLI commands, public API surface); (3) most outgoing calls. Sort by
+    # key too so selection is deterministic for fingerprinting.
+    candidates.sort(key=lambda c: (not c[3], not c[2], -c[1], c[0]))
     return [c[0] for c in candidates[:MAX_SEQUENCE_FLOWS]]
 
 
@@ -118,7 +121,7 @@ def _sanitize_id(qualified_name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_]", "_", qualified_name) or "P"
 
 
-def render_mermaid_sequence(entry: EntryKey, steps: list[SequenceStep]) -> str:
+def render_mermaid_sequence(entry: EntryKey, steps: list[SequenceStep], layer_of: dict[str, Layer | None]) -> str:
     if not steps:
         return ""
 
@@ -138,7 +141,7 @@ def render_mermaid_sequence(entry: EntryKey, steps: list[SequenceStep]) -> str:
     # and then another service still renders with both services left of
     # the repository. Ties (same layer) keep call/first-seen order.
     first_seen_index = {p: i for i, p in enumerate(participants)}
-    participants.sort(key=lambda p: (_layer_rank(p), first_seen_index[p]))
+    participants.sort(key=lambda p: (layer_rank(layer_of.get(p)), first_seen_index[p]))
 
     lines = ["sequenceDiagram"]
     for p in participants:
@@ -151,9 +154,11 @@ def render_mermaid_sequence(entry: EntryKey, steps: list[SequenceStep]) -> str:
 def build_sequence_flows(repo_ir: RepoIR, index: SymbolIndex) -> list[SequenceFlow]:
     edges = build_call_graph(repo_ir, index)
     grouped = group_by_caller(edges)
+    layer_of = {qname: classify_layer(entry.class_info) for qname, entry in index.by_qualified_name.items()}
 
     flows = []
     for entry in _select_entry_points(repo_ir, grouped):
         steps = _trace_flow(entry, grouped)
-        flows.append(SequenceFlow(entry_class=entry[0], entry_method=entry[1], steps=steps, mermaid=render_mermaid_sequence(entry, steps)))
+        mermaid = render_mermaid_sequence(entry, steps, layer_of)
+        flows.append(SequenceFlow(entry_class=entry[0], entry_method=entry[1], steps=steps, mermaid=mermaid))
     return flows

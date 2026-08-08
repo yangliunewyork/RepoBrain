@@ -15,6 +15,17 @@ exclude_patterns:
   - "**/node_modules/**"
   - "**/*.min.js"
   - ".repobrain/**"
+  # Test code: excluded so test methods never get mistaken for real
+  # application entry points in generated docs (a @Test method with no
+  # other callers looks exactly like a legitimate entry point otherwise).
+  # Patterns mirror Maven Surefire/Failsafe's own default test-class
+  # naming conventions.
+  - "**/src/test/**"
+  - "**/Test*.java"
+  - "**/*Test.java"
+  - "**/*Tests.java"
+  - "**/*TestCase.java"
+  - "**/*IT.java"
 
 # Where generated documentation files are written, relative to the
 # repository root being analyzed.

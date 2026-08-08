@@ -40,13 +40,17 @@ rest of the pipeline (see [Extending RepoBrain](#extending-repobrain)).
 
 1. **Scanning** (`repobrain/scanner/repo_scanner.py`) — lists every non-ignored file in the
    repository via `git ls-files`, so `.gitignore` is respected for free. RepoBrain requires the
-   target to be a Git working tree (this is also what makes incremental updates possible).
+   target to be a Git working tree (this is also what makes incremental updates possible). Test
+   sources are excluded by default (`src/test/**`, `*Test.java`, `*IT.java`, ... — mirroring Maven
+   Surefire/Failsafe's own conventions) so a test method with no other callers never gets mistaken
+   for a real application entry point in SEQUENCE.md.
 2. **Parsing** (`repobrain/parsing/`) — each file is parsed by a `LanguageParser` implementation
    using [Tree-sitter](https://tree-sitter.github.io/tree-sitter/). `JavaParser` walks the concrete
    syntax tree and extracts package, imports, classes/interfaces/enums/records, fields, methods,
-   modifiers, Javadoc, and each method's body call sites (receiver + method name, in source order)
-   — into the language-agnostic IR defined in `repobrain/ir/models.py` (`FileIR`, `ClassInfo`,
-   `MethodInfo`, `MethodCall`, …).
+   modifiers, annotations (class- and method-level, e.g. `@RestController`, `@GetMapping`, `@Test`),
+   Javadoc, and each method's body call sites (receiver + method name, in source order) — into the
+   language-agnostic IR defined in `repobrain/ir/models.py` (`FileIR`, `ClassInfo`, `MethodInfo`,
+   `MethodCall`, …).
 3. **Analysis** (`repobrain/analysis/`) —
    - `symbol_extractor.py` flattens the parsed repo into a `SymbolIndex` (lookup by qualified name,
      simple name, and package).
@@ -59,22 +63,47 @@ rest of the pipeline (see [Extending RepoBrain](#extending-repobrain)).
      method)` edges — the basis for sequence diagrams. Calls on local variables, chained
      expressions (`a.b().c()`), or external/JDK types don't resolve and are dropped rather than
      guessed.
+   - `layers.py` classifies each class as `api`/`service`/`domain`/`data`/unclassified. Framework
+     annotations (`@RestController`/`@Controller`/`@*Mapping` → api, `@Service` → service,
+     `@Entity`/`@Table`/`@Document`/`@Embeddable` → domain, `@Repository`/`@Dao` → data) are checked
+     first — a verified signal, not a guess — then a name-keyword fallback (`*Controller`,
+     `*Repository`, ...), then a structural fallback for domain types with no annotation at all (a
+     class/record with an instance field, or any enum). Also aggregates the class-level dependency
+     graph into a small **component graph** (`component_graph`) — API/Service/Domain/Data/Other
+     nodes plus a node per detected external system — a far more legible "architecture" view than
+     one node per Java package.
+   - `external_systems.py` classifies real import statements against known library prefixes
+     (JDBC/JPA, NoSQL/cache, messaging, HTTP clients, cloud SDKs, email) into categories like
+     "Relational Database" or "Cloud Provider SDK" — grounding ARCHITECTURE.md's "what external
+     systems does this talk to" answer in actual imports rather than a guess.
 4. **Documentation generation** (`repobrain/docgen/`) —
    - `context.py` renders the index + dependency graph into compact `ClassCard`/`ProjectContext`
-     summaries, and folds in `sequence.py`'s selected call flows — this structured summary is the
-     only thing ever sent to the LLM.
-   - `sequence.py` picks up to 8 "likely entry point" methods (public, not themselves called by
-     other resolved project code, ranked by outgoing-call count), traces each one through the call
-     graph (depth- and step-capped to stay readable), and renders each as a **deterministic**
-     Mermaid `sequenceDiagram` block — the diagram itself is never left to the LLM to reproduce;
-     only the prose describing it is. Participants are laid out left-to-right by architectural
-     layer (API/controller → service → repository/database, inferred from package and class name
-     keywords), not raw call order — so a service that touches its repository before calling
-     another service still renders with the repository on the right.
+     summaries — including each class's verified layer and a repo-wide layer breakdown — and folds
+     in `sequence.py`'s selected call flows. This structured summary is the only thing ever sent
+     to the LLM.
+   - `sequence.py` selects up to 8 flows, preferring (1) methods with an explicit route/handler
+     annotation (`@GetMapping`, `@RequestMapping`, JAX-RS `@GET`/`@Path`, ...) — a confirmed entry
+     point, not a heuristic; then (2) public methods not themselves called by other resolved
+     project code; ranked by outgoing-call count. Methods annotated `@Test`/`@ParameterizedTest`/
+     etc. are never candidates, as a second layer of defense beyond file-level exclusion. Each
+     flow is traced through the call graph (depth- and step-capped to stay readable) and rendered
+     as a **deterministic** Mermaid `sequenceDiagram` — the diagram itself is never left to the
+     LLM to reproduce, only the prose describing it is. Participants are laid out left-to-right by
+     `layers.py`'s classification (API → service → data), not raw call order — so a service that
+     touches its repository before calling another service still renders with the repository on
+     the right.
    - `prompts.py` + `generators.py` turn that context into one prompt per document.
-   - `fingerprints.py` hashes the *structural* shape relevant to each document (signatures/package
-     edges for ARCHITECTURE.md, resolved call chains for SEQUENCE.md, etc.) so `repobrain update`
-     can skip regenerating a document whose relevant structure didn't actually change.
+     ARCHITECTURE.md's prompt is organized entirely around responsibility and runtime behavior,
+     never around package layout: it states the verified layer breakdown, external systems, and
+     domain model as ground truth, includes the "primary request flow" (the highest-confidence
+     sequence flow — see below), and instructs the model to answer six questions explicitly as
+     sections — what the service does, its business capabilities, its runtime components, the
+     external systems it talks to, where data enters/exits, and its primary request flow — rather
+     than describing packages.
+   - `fingerprints.py` hashes the *structural* shape relevant to each document (full per-class
+     shape + layer breakdown + external systems + primary flow for ARCHITECTURE.md, resolved call
+     chains for SEQUENCE.md, etc.) so `repobrain update` can skip regenerating a document whose
+     relevant structure didn't actually change.
 5. **LLM call** (`repobrain/llm/`) — `OllamaProvider` posts to the local Ollama HTTP API
    (`/api/generate`, `/api/tags`), with `think: false` for Qwen3-style models to skip the
    `<think>` reasoning trace.
@@ -102,7 +131,8 @@ repobrain/
   ir/models.py             language-agnostic intermediate representation
   scanner/                 file discovery (Git-aware) + git diff-based change detection
   parsing/                 LanguageParser interface, JavaParser (tree-sitter), registry
-  analysis/                symbol index, dependency graph, and call graph construction
+  analysis/                symbol index, dependency graph, call graph, layer/domain classification,
+                           component graph, and external-system detection
   llm/                     LLMProvider interface, OllamaProvider, registry
   docgen/                  prompt context, sequence diagrams, prompts, generators, fingerprints
   cache/                   on-disk incremental-update state store
@@ -152,12 +182,14 @@ Copy `config/repobrain.example.yaml` into a target repo and pass `--config` to o
 pytest
 ```
 
-The suite (90 tests) covers the scanner, the Java parser (generics, nested classes, enums,
-records, malformed source, call-site extraction), the dependency graph, the call graph and
-sequence-diagram selection/tracing/layer-ordering, git-diff-based change detection, the
-fingerprint/skip logic, and the CLI — all against a fake, deterministic `LLMProvider` so it never
-needs a running Ollama daemon. `tests/fixtures/sample_java_repo` is a tiny hand-written 4-class
-Java project used throughout.
+The suite (133 tests) covers the scanner (including default test-source exclusion and a
+regression test for a glob-matching edge case in top-level directory excludes), the Java parser
+(generics, nested classes, enums, records, malformed source, call-site extraction, annotation
+extraction), the dependency graph, layer/domain classification and the component graph, external-
+system detection, the call graph and sequence-diagram selection/tracing/annotation-aware entry
+points/layer-ordering, git-diff-based change detection, the fingerprint/skip logic, and the CLI —
+all against a fake, deterministic `LLMProvider` so it never needs a running Ollama daemon.
+`tests/fixtures/sample_java_repo` is a tiny hand-written 4-class Java project used throughout.
 
 ## Extending RepoBrain
 
@@ -186,6 +218,33 @@ Java project used throughout.
 - Call resolution (for SEQUENCE.md) only tracks receivers that are fields or method parameters —
   a call on a local variable (`Widget w = make(); w.getName();`) won't resolve, since local
   variable types aren't tracked. This undercounts flows in code that assigns to locals before
-  calling, but avoids guessing wrong. Entry-point selection is a heuristic ("public, not called by
-  other resolved project code, most outgoing calls") — it's a reasonable proxy for "meaningful
-  workflow," not a guarantee; some genuinely important flows may not surface.
+  calling, but avoids guessing wrong.
+- Entry-point selection prefers a verified route/handler annotation when one is present, but falls
+  back to a heuristic ("public, not called by other resolved project code, most outgoing calls")
+  for everything else — a reasonable proxy for "meaningful workflow," not a guarantee; some
+  genuinely important flows in unannotated code may not surface.
+- Layer classification (`analysis/layers.py`) recognizes Spring (`@RestController`, `@Controller`,
+  `@*Mapping`, `@Service`, `@Repository`, `@Entity`, `@Table`, `@Document`) and JAX-RS (`@Path`,
+  `@GET`/`@POST`/...) annotations today; other frameworks fall back to the name-keyword heuristic,
+  which is weaker. Extending the recognized annotation sets in `layers.py` (and the route/test
+  annotation sets in `docgen/sequence.py`) is the natural way to support another framework.
+- The domain-model structural fallback (any class/record with an instance field, or any enum,
+  once annotation and keyword checks come up empty) is intentionally broad — DTOs, request/
+  response objects, and config-holder classes with plain fields will also get classified as
+  "domain" if they don't match anything more specific first. This trades some over-inclusion for
+  never missing a real domain type; a class made entirely of static members is the one shape
+  reliably excluded.
+- External-system detection (`analysis/external_systems.py`) only recognizes a fixed list of
+  common JVM ecosystem library prefixes (JDBC/JPA/Hibernate, MongoDB/Redis, Kafka/RabbitMQ,
+  OkHttp/Retrofit/Apache HttpClient, AWS/GCP/Azure SDKs, JavaMail). An integration using something
+  else — an in-house client library, a less common driver — won't be detected; extending
+  `_CATEGORY_PREFIXES` is the way to add more.
+- The LLM can still embellish beyond the grounded facts even when instructed not to (e.g.
+  inferring a specific state-transition story from an enum's constant names alone) — the prompt
+  explicitly warns against this for the domain model section, but an 8B local model won't catch
+  every case. Review generated prose the same way you'd review the diagrams: the structure is
+  verified, some of the narrative around it is the model's inference.
+- Test-code exclusion is pattern-based (`src/test/**`, `*Test.java`, `*IT.java`, ...) plus an
+  annotation-level backstop for `@Test`/`@ParameterizedTest`/etc. methods specifically; a test
+  class using neither a recognized path/suffix convention nor a recognized test annotation could
+  still slip through and appear in generated docs.

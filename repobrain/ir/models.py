@@ -41,6 +41,11 @@ class MethodInfo:
     return_type: str
     parameters: list[ParameterInfo] = field(default_factory=list)
     modifiers: list[str] = field(default_factory=list)
+    #: Simple annotation names (no `@`, no arguments), e.g. "Test",
+    #: "GetMapping". Framework/annotation-aware analysis (entry-point
+    #: detection, layer classification) reads this instead of guessing
+    #: from the method/class name.
+    annotations: list[str] = field(default_factory=list)
     doc_comment: Optional[str] = None
     is_constructor: bool = False
     start_line: int = 0
@@ -72,6 +77,8 @@ class ClassInfo:
     kind: str  # "class" | "interface" | "enum" | "record" | "annotation"
     qualified_name: str
     modifiers: list[str] = field(default_factory=list)
+    #: Simple annotation names (no `@`, no arguments), e.g. "RestController".
+    annotations: list[str] = field(default_factory=list)
     extends: list[str] = field(default_factory=list)
     implements: list[str] = field(default_factory=list)
     type_parameters: list[str] = field(default_factory=list)
@@ -147,6 +154,7 @@ def _class_from_dict(data: dict) -> ClassInfo:
             return_type=m["return_type"],
             parameters=[ParameterInfo(**p) for p in m.get("parameters", [])],
             modifiers=m.get("modifiers", []),
+            annotations=m.get("annotations", []),
             doc_comment=m.get("doc_comment"),
             is_constructor=m.get("is_constructor", False),
             start_line=m.get("start_line", 0),
@@ -162,6 +170,7 @@ def _class_from_dict(data: dict) -> ClassInfo:
         kind=data["kind"],
         qualified_name=data["qualified_name"],
         modifiers=data.get("modifiers", []),
+        annotations=data.get("annotations", []),
         extends=data.get("extends", []),
         implements=data.get("implements", []),
         type_parameters=data.get("type_parameters", []),

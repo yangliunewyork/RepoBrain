@@ -148,6 +148,65 @@ def test_layer_order_wins_over_raw_call_order():
     assert order.index("OrderService") < order.index("PricingService") < order.index("OrderRepository")
 
 
+def test_test_annotated_method_is_never_an_entry_point():
+    """A @Test method that calls several services and isn't itself
+    called by anything else looks exactly like a legitimate entry point
+    under the outgoing-call heuristic -- the annotation check must
+    override that, as a second layer of defense beyond file-level
+    exclusion (for test code that lives outside a conventional test dir)."""
+    flows = _flows(
+        {
+            "WidgetServiceTest.java": (
+                "public class WidgetServiceTest { private WidgetService s; "
+                "@Test public void testEverything() { s.find(); s.save(); s.delete(); } }"
+            ),
+            "WidgetService.java": (
+                "public class WidgetService { public void find() {} public void save() {} public void delete() {} }"
+            ),
+        }
+    )
+    entries = {(f.entry_class, f.entry_method) for f in flows}
+    assert ("WidgetServiceTest", "testEverything") not in entries
+
+
+def test_other_junit_style_test_annotations_are_also_excluded():
+    flows = _flows(
+        {
+            "A.java": (
+                "public class A { private B b; "
+                "@ParameterizedTest public void testParam() { b.step(); } }"
+            ),
+            "B.java": "public class B { public void step() {} }",
+        }
+    )
+    assert flows == []
+
+
+def test_route_annotated_method_is_preferred_over_higher_call_count():
+    """A @GetMapping method with fewer outgoing calls should still be
+    selected ahead of a plain method with more outgoing calls -- the
+    route annotation is a verified entry point, not a heuristic guess."""
+    flows = _flows(
+        {
+            "WidgetController.java": (
+                "public class WidgetController { private WidgetService s; "
+                "@GetMapping(\"/widgets\") public void list() { s.findAll(); } }"
+            ),
+            "WidgetService.java": (
+                "public class WidgetService { private WidgetRepo r; "
+                "public void findAll() { r.query(); } "
+                "public void busyMethod() { r.query(); r.query2(); r.query3(); r.query4(); } }"
+            ),
+            "WidgetRepo.java": (
+                "public class WidgetRepo { public void query() {} public void query2() {} "
+                "public void query3() {} public void query4() {} }"
+            ),
+        }
+    )
+    assert flows[0].entry_class == "WidgetController"
+    assert flows[0].entry_method == "list"
+
+
 def test_flow_count_is_capped():
     sources = {"B.java": "public class B { public void step() {} }"}
     for i in range(MAX_SEQUENCE_FLOWS + 5):

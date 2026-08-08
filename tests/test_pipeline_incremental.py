@@ -63,7 +63,9 @@ def test_update_regenerates_docs_when_a_new_class_is_added(git_repo, fake_llm):
     written = {r.filename for r in summary.doc_results if r.written}
     assert "README.md" in written  # a new public class was added
     assert "SEQUENCE.md" in written  # discount() -> Widget.getPrice() is a new resolvable call
-    assert "ARCHITECTURE.md" not in written  # no new cross-package edge (Widget was already reachable)
+    # ARCHITECTURE.md's prompt lists every class as a card, so a brand-new
+    # class regenerates it too even without a new cross-package edge.
+    assert "ARCHITECTURE.md" in written
 
 
 def test_update_handles_deleted_file(git_repo, fake_llm):

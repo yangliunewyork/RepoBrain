@@ -10,6 +10,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from repobrain.analysis.dependency_analyzer import DependencyGraph, external_package_usage, to_mermaid
+from repobrain.analysis.external_systems import classify_external_systems
+from repobrain.analysis.layers import classify_layer, component_graph, layer_breakdown
 from repobrain.analysis.symbol_extractor import ClassEntry, SymbolIndex
 from repobrain.docgen.sequence import SequenceFlow, build_sequence_flows
 from repobrain.ir.models import ClassInfo, RepoIR
@@ -68,9 +70,15 @@ class ClassCard:
     methods: list[str]  # signatures
     depends_on: list[str]
     depended_on_by: list[str]
+    #: "api" | "service" | "data" | None, from `analysis.layers.classify_layer`
+    #: — verified from framework annotations (or a name-keyword fallback),
+    #: not left for the LLM to infer.
+    layer: str | None = None
 
     def render(self, include_dependencies: bool = True) -> str:
         lines = [f"### {self.kind} {self.qualified_name}"]
+        if self.layer:
+            lines.append(f"- layer: {self.layer}")
         if self.modifiers:
             lines.append(f"- modifiers: {', '.join(self.modifiers)}")
         if self.extends:
@@ -104,13 +112,38 @@ class ProjectContext:
     file_count: int
     class_count: int
     package_summaries: list[PackageSummary]
-    dependency_mermaid: str
+    #: Mermaid `sequenceDiagram`-style component graph — API / Service /
+    #: Domain / Data / Other plus any detected external-system category
+    #: — from `analysis.layers.component_graph`. Deliberately *not* a
+    #: per-package graph: package structure is an implementation detail,
+    #: not an architectural one.
+    component_mermaid: str
     external_packages: list[tuple[str, int]]
+    #: External systems/integrations detected from real imports (JDBC/JPA,
+    #: message queues, HTTP clients, cloud SDKs, ...), category -> the
+    #: recognized library prefixes actually found. See
+    #: `analysis.external_systems.classify_external_systems`.
+    external_systems: dict[str, list[str]]
     sequence_flows: list[SequenceFlow]
+    #: Qualified names grouped by "api"/"service"/"domain"/"data"/
+    #: "unclassified", computed over *every* class regardless of prompt
+    #: truncation — see `analysis.layers.layer_breakdown`.
+    layer_breakdown: dict[str, list[str]]
     truncated: bool
 
     def all_class_cards(self) -> list[ClassCard]:
         return [c for pkg in self.package_summaries for c in pkg.classes]
+
+    def classes_by_layer(self, layer: str) -> list[ClassCard]:
+        return [c for c in self.all_class_cards() if c.layer == layer]
+
+    @property
+    def primary_request_flow(self) -> SequenceFlow | None:
+        """The highest-confidence sequence flow (route-annotated entry
+        points rank first, see `docgen.sequence._select_entry_points`),
+        used as ARCHITECTURE.md's "how does a request actually flow
+        through this system" anchor."""
+        return self.sequence_flows[0] if self.sequence_flows else None
 
 
 def _capped(items: list[str], limit: int) -> list[str]:
@@ -137,6 +170,7 @@ def _build_class_card(entry: ClassEntry, graph: DependencyGraph) -> ClassCard:
         methods=methods,
         depends_on=depends_on,
         depended_on_by=depended_on_by,
+        layer=classify_layer(info),
     )
 
 
@@ -181,15 +215,17 @@ def build_project_context(
 
     truncated = detailed_count < total_classes
 
-    pkg_graph = graph.package_graph(index)
+    external_systems = classify_external_systems(repo_ir)
     return ProjectContext(
         repo_name=repo_root_name,
         languages=languages,
         file_count=len(repo_ir.files),
         class_count=total_classes,
         package_summaries=package_summaries,
-        dependency_mermaid=to_mermaid(pkg_graph),
+        component_mermaid=to_mermaid(component_graph(repo_ir, index, graph, external_systems)),
         external_packages=external_package_usage(repo_ir),
+        external_systems=external_systems,
         sequence_flows=build_sequence_flows(repo_ir, index),
+        layer_breakdown=layer_breakdown([e.class_info for e in index.by_qualified_name.values()]),
         truncated=truncated,
     )

@@ -65,3 +65,63 @@ def test_char_budget_scales_with_num_ctx():
     large = char_budget_for_num_ctx(32768)
     assert large > small
     assert small > 0
+
+
+def _context_from_sources(sources: dict[str, str]):
+    parser = JavaParser()
+    files = {path: parser.parse(path, src.encode("utf-8")) for path, src in sources.items()}
+    repo_ir = RepoIR(repo_root="/repo", generated_at=datetime.now(timezone.utc).isoformat(), files=files)
+    index = build_symbol_index(repo_ir)
+    graph = build_dependency_graph(repo_ir, index)
+    return build_project_context("repo", repo_ir, index, graph, ["java"])
+
+
+def test_component_mermaid_reflects_layers_not_packages():
+    ctx = _context_from_sources(
+        {
+            "a/WidgetController.java": (
+                "package a; @RestController public class WidgetController { private WidgetBrain b; "
+                "public void get() { b.find(); } }"
+            ),
+            "b/WidgetBrain.java": "package b; @Service public class WidgetBrain { public void find() {} }",
+        }
+    )
+    assert "API" in ctx.component_mermaid
+    assert "Service" in ctx.component_mermaid
+    # The package names themselves shouldn't appear as graph node labels.
+    assert '"a"' not in ctx.component_mermaid and '"b"' not in ctx.component_mermaid
+
+
+def test_external_systems_populated_from_imports():
+    ctx = _context_from_sources(
+        {"A.java": "import javax.persistence.Entity;\n@Repository public class A { public void save() {} }"}
+    )
+    assert ctx.external_systems == {"Relational Database": ["javax.persistence"]}
+
+
+def test_classes_by_layer_filters_correctly():
+    ctx = _context_from_sources(
+        {
+            "A.java": "@RestController public class A { public void get() {} }",
+            "B.java": "@Entity public class B { private int x; }",
+        }
+    )
+    assert [c.qualified_name for c in ctx.classes_by_layer("api")] == ["A"]
+    assert [c.qualified_name for c in ctx.classes_by_layer("domain")] == ["B"]
+    assert ctx.classes_by_layer("data") == []
+
+
+def test_primary_request_flow_is_first_sequence_flow():
+    ctx = _context_from_sources(
+        {
+            "A.java": "@RestController public class A { private B b; public void get() { b.step(); } }",
+            "B.java": "public class B { public void step() {} }",
+        }
+    )
+    assert ctx.primary_request_flow is not None
+    assert ctx.primary_request_flow is ctx.sequence_flows[0]
+
+
+def test_primary_request_flow_is_none_when_no_flows():
+    ctx = _context_from_sources({"A.java": "public class A {}"})
+    assert ctx.primary_request_flow is None

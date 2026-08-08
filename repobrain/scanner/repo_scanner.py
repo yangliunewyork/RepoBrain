@@ -49,7 +49,19 @@ def is_git_repository(repo_root: Path) -> bool:
 
 
 def _is_excluded(rel_path: str, exclude_patterns: list[str]) -> bool:
-    return any(fnmatch.fnmatch(rel_path, pattern) for pattern in exclude_patterns)
+    for pattern in exclude_patterns:
+        if fnmatch.fnmatch(rel_path, pattern):
+            return True
+        # fnmatch translates a leading "**/" into a regex that still
+        # requires a literal "/" before the rest of the pattern, so
+        # "**/build/**" alone fails to match a top-level "build/"
+        # directory (there's no parent segment to supply that slash).
+        # Falling back to the pattern with "**/" stripped restores the
+        # usual gitignore-style meaning: match at any depth, including
+        # the repo root.
+        if pattern.startswith("**/") and fnmatch.fnmatch(rel_path, pattern[3:]):
+            return True
+    return False
 
 
 class RepoScanner:

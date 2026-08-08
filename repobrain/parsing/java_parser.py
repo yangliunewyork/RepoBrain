@@ -60,13 +60,18 @@ def _doc_comment_for(node: Node, source: bytes) -> str | None:
     return None
 
 
-def _modifiers_of(node: Node, source: bytes) -> list[str]:
+def _find_modifiers_node(node: Node) -> Node | None:
     mods_node = node.child_by_field_name("modifiers")
-    if mods_node is None:
-        for child in node.children:
-            if child.type == "modifiers":
-                mods_node = child
-                break
+    if mods_node is not None:
+        return mods_node
+    for child in node.children:
+        if child.type == "modifiers":
+            return child
+    return None
+
+
+def _modifiers_of(node: Node, source: bytes) -> list[str]:
+    mods_node = _find_modifiers_node(node)
     if mods_node is None:
         return []
     result = []
@@ -74,6 +79,26 @@ def _modifiers_of(node: Node, source: bytes) -> list[str]:
         text = _text(child, source)
         if text in _MODIFIER_KEYWORDS:
             result.append(text)
+    return result
+
+
+def _annotations_of(node: Node, source: bytes) -> list[str]:
+    """Simple annotation names (no `@`, no arguments) applied to a class
+    or method declaration, e.g. `@RestController` -> "RestController".
+    Annotations sit inside the same `modifiers` node as keywords like
+    `public`, as either `marker_annotation` (`@Foo`) or `annotation`
+    (`@Foo(...)`), each with an `identifier` (or `scoped_identifier` for
+    a fully-qualified annotation type) child holding the name.
+    """
+    mods_node = _find_modifiers_node(node)
+    if mods_node is None:
+        return []
+    result = []
+    for child in mods_node.children:
+        if child.type in ("marker_annotation", "annotation"):
+            name_node = next((c for c in child.children if c.type in ("identifier", "scoped_identifier")), None)
+            if name_node is not None:
+                result.append(_text(name_node, source).rsplit(".", 1)[-1])
     return result
 
 
@@ -220,6 +245,7 @@ class JavaParser(LanguageParser):
         qualified = f"{outer_qualified}.{name}" if outer_qualified else (f"{package}.{name}" if package else name)
 
         modifiers = _modifiers_of(node, source)
+        annotations = _annotations_of(node, source)
         type_params = self._parse_type_parameters(node, source)
         extends, implements = self._parse_supertypes(node, kind, source)
 
@@ -228,6 +254,7 @@ class JavaParser(LanguageParser):
             kind=kind,
             qualified_name=qualified,
             modifiers=modifiers,
+            annotations=annotations,
             extends=extends,
             implements=implements,
             type_parameters=type_params,
@@ -324,6 +351,7 @@ class JavaParser(LanguageParser):
 
         params = _parse_parameters(node.child_by_field_name("parameters"), source)
         modifiers = _modifiers_of(node, source)
+        annotations = _annotations_of(node, source)
         doc = _doc_comment_for(node, source)
 
         calls: list[MethodCall] = []
@@ -337,6 +365,7 @@ class JavaParser(LanguageParser):
             return_type=return_type,
             parameters=params,
             modifiers=modifiers,
+            annotations=annotations,
             doc_comment=doc,
             is_constructor=is_constructor,
             start_line=node.start_point[0] + 1,
