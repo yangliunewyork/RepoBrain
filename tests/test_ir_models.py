@@ -16,6 +16,8 @@ def _sample_repo_ir() -> RepoIR:
         return_type="String",
         parameters=[ParameterInfo(name="x", type="int")],
         modifiers=["public"],
+        annotations=["GetMapping"],
+        annotation_args={"GetMapping": "/name"},
         doc_comment="/** doc */",
         calls=[MethodCall(receiver=None, method="helper")],
         referenced_types=["Widget"],
@@ -26,6 +28,8 @@ def _sample_repo_ir() -> RepoIR:
         kind="class",
         qualified_name="com.example.Outer",
         modifiers=["public"],
+        annotations=["RestController"],
+        annotation_args={"RequestMapping": "/outer"},
         extends=["Base"],
         implements=["Runnable"],
         fields=[FieldInfo(name="name", type="String", modifiers=["private"])],
@@ -79,4 +83,6 @@ def test_repo_ir_round_trips_through_dict():
     assert [f.name for f in restored_cls.fields] == [f.name for f in orig_cls.fields]
     assert [m.signature for m in restored_cls.methods] == [m.signature for m in orig_cls.methods]
     assert restored_cls.methods[0].calls == orig_cls.methods[0].calls
+    assert restored_cls.annotation_args == orig_cls.annotation_args
+    assert restored_cls.methods[0].annotation_args == orig_cls.methods[0].annotation_args
     assert [c.name for c in restored_cls.inner_classes] == [c.name for c in orig_cls.inner_classes]

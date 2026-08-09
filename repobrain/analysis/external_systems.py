@@ -21,6 +21,7 @@ _CATEGORY_PREFIXES: dict[str, tuple[str, ...]] = {
         "org.hibernate", "org.postgresql", "com.mysql", "com.microsoft.sqlserver",
         "oracle.jdbc", "com.zaxxer.hikari", "org.springframework.jdbc",
         "org.springframework.data.jpa", "org.flywaydb", "org.liquibase",
+        "org.jooq", "org.apache.ibatis", "org.mybatis", "org.jdbi",
     ),
     "NoSQL / Cache": (
         "com.mongodb", "org.springframework.data.mongodb", "redis.clients",

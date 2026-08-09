@@ -76,5 +76,14 @@ def test_to_mermaid_produces_valid_looking_graph():
     index = build_symbol_index(repo_ir)
     graph = build_dependency_graph(repo_ir, index)
     mermaid = to_mermaid(graph.package_graph(index))
+    assert mermaid.startswith("graph TD")
+    assert "-->" in mermaid
+
+
+def test_to_mermaid_orientation_is_overridable():
+    repo_ir = _build_fixture_repo_ir()
+    index = build_symbol_index(repo_ir)
+    graph = build_dependency_graph(repo_ir, index)
+    mermaid = to_mermaid(graph.package_graph(index), orientation="LR")
     assert mermaid.startswith("graph LR")
     assert "-->" in mermaid

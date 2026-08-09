@@ -53,16 +53,18 @@ def test_update_regenerates_docs_when_a_new_class_is_added(git_repo, fake_llm):
     new_file = git_repo / "src/main/java/com/example/service/PricingService.java"
     new_file.write_text(
         "package com.example.service;\n"
-        "import com.example.model.Widget;\n"
+        "import com.example.repo.WidgetRepository;\n"
         "public class PricingService {\n"
-        "    public double discount(Widget w) { return w.getPrice(); }\n"
+        "    private final WidgetRepository repository;\n"
+        "    public PricingService(WidgetRepository repository) { this.repository = repository; }\n"
+        "    public void run() { repository.findAll(); }\n"
         "}\n"
     )
 
     summary = pipeline.run_update()
     written = {r.filename for r in summary.doc_results if r.written}
     assert "README.md" in written  # a new public class was added
-    assert "SEQUENCE.md" in written  # discount() -> Widget.getPrice() is a new resolvable call
+    assert "SEQUENCE.md" in written  # run() -> WidgetRepository.findAll() is a new resolvable, architecturally meaningful call
     # ARCHITECTURE.md's prompt lists every class as a card, so a brand-new
     # class regenerates it too even without a new cross-package edge.
     assert "ARCHITECTURE.md" in written

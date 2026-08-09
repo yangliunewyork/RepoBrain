@@ -67,15 +67,17 @@ rest of the pipeline (see [Extending RepoBrain](#extending-repobrain)).
      annotations (`@RestController`/`@Controller`/`@*Mapping` → api, `@Service` → service,
      `@Entity`/`@Table`/`@Document`/`@Embeddable` → domain, `@Repository`/`@Dao` → data) are checked
      first — a verified signal, not a guess — then a name-keyword fallback (`*Controller`,
-     `*Repository`, ...), then a structural fallback for domain types with no annotation at all (a
-     class/record with an instance field, or any enum). Also aggregates the class-level dependency
-     graph into a small **component graph** (`component_graph`) — API/Service/Domain/Data/Other
-     nodes plus a node per detected external system — a far more legible "architecture" view than
-     one node per Java package.
+     `*Repository`, `*Dao`, ...), then a structural fallback for domain types with no annotation at
+     all: a class/record with an instance field, or any enum, *unless* one of its methods delegates
+     to that field (`repo.save(...)`) — which marks it as a component (service/DAO/etc.) rather than
+     a data-holding domain object, even with no annotation to say so. Also aggregates the
+     class-level dependency graph into a small **component graph** (`component_graph`) —
+     Client → API → Service → Domain/Data → external-system nodes, rendered top-down — a far more
+     legible "architecture" view than one node per Java package.
    - `external_systems.py` classifies real import statements against known library prefixes
-     (JDBC/JPA, NoSQL/cache, messaging, HTTP clients, cloud SDKs, email) into categories like
-     "Relational Database" or "Cloud Provider SDK" — grounding ARCHITECTURE.md's "what external
-     systems does this talk to" answer in actual imports rather than a guess.
+     (JDBC/JPA, jOOQ, MyBatis, NoSQL/cache, messaging, HTTP clients, cloud SDKs, email) into
+     categories like "Relational Database" or "Cloud Provider SDK" — grounding ARCHITECTURE.md's
+     "what external systems does this talk to" answer in actual imports rather than a guess.
 4. **Documentation generation** (`repobrain/docgen/`) —
    - `context.py` renders the index + dependency graph into compact `ClassCard`/`ProjectContext`
      summaries — including each class's verified layer and a repo-wide layer breakdown — and folds
@@ -85,13 +87,24 @@ rest of the pipeline (see [Extending RepoBrain](#extending-repobrain)).
      annotation (`@GetMapping`, `@RequestMapping`, JAX-RS `@GET`/`@Path`, ...) — a confirmed entry
      point, not a heuristic; then (2) public methods not themselves called by other resolved
      project code; ranked by outgoing-call count. Methods annotated `@Test`/`@ParameterizedTest`/
-     etc. are never candidates, as a second layer of defense beyond file-level exclusion. Each
-     flow is traced through the call graph (depth- and step-capped to stay readable) and rendered
-     as a **deterministic** Mermaid `sequenceDiagram` — the diagram itself is never left to the
-     LLM to reproduce, only the prose describing it is. Participants are laid out left-to-right by
-     `layers.py`'s classification (API → service → data), not raw call order — so a service that
-     touches its repository before calling another service still renders with the repository on
-     the right.
+     etc. are never candidates, as a second layer of defense beyond file-level exclusion. Each flow
+     is traced through the call graph (depth- and step-capped to stay readable) and rendered as a
+     **deterministic**, full-round-trip Mermaid `sequenceDiagram` — never left to the LLM to
+     reproduce, only the prose describing it is:
+     - A synthetic **Client** participant issues the initiating call, labeled with the actual HTTP
+       method + path (e.g. `POST /products`, combining a class-level `@RequestMapping` base path
+       with the method's own route annotation) when one is available, else the plain method name.
+     - Dashed **return arrows** unwind the call stack in reverse, each labeled with that call's
+       real declared return type — a void method draws no return arrow rather than a fabricated
+       generic "ok".
+     - If the deepest class the flow actually reaches imports a recognized external-system library
+       (a JDBC/JPA driver, jOOQ, MyBatis, a message queue client, ...), one more hop to that system
+       is appended as the visible sink, so a flow into a repository doesn't just stop at the last
+       line of application code — it continues to "Database" (or whatever it actually is) the way
+       a real request does.
+     - Participants are laid out left-to-right Client → API → Service → Domain/Data → external
+       system, via `layers.py`'s classification, not raw call order — so a service that touches its
+       repository before calling another service still renders with the repository to the right.
    - `prompts.py` + `generators.py` turn that context into one prompt per document.
      ARCHITECTURE.md's prompt is organized entirely around responsibility and runtime behavior,
      never around package layout: it states the verified layer breakdown, external systems, and
@@ -182,13 +195,16 @@ Copy `config/repobrain.example.yaml` into a target repo and pass `--config` to o
 pytest
 ```
 
-The suite (133 tests) covers the scanner (including default test-source exclusion and a
+The suite (145 tests) covers the scanner (including default test-source exclusion and a
 regression test for a glob-matching edge case in top-level directory excludes), the Java parser
-(generics, nested classes, enums, records, malformed source, call-site extraction, annotation
-extraction), the dependency graph, layer/domain classification and the component graph, external-
-system detection, the call graph and sequence-diagram selection/tracing/annotation-aware entry
-points/layer-ordering, git-diff-based change detection, the fingerprint/skip logic, and the CLI —
-all against a fake, deterministic `LLMProvider` so it never needs a running Ollama daemon.
+(generics, nested classes, enums, records, malformed source, call-site extraction, annotation and
+annotation-argument extraction), the dependency graph, layer/domain classification (including the
+field-delegation refinement that keeps a field-injected service from being misread as a domain
+object) and the component graph, external-system detection, the call graph and sequence-diagram
+selection/tracing/round-trip rendering (Client participant, route labels, return arrows, external
+terminal hops, layer-ordering), git-diff-based change detection, the fingerprint/skip logic, and
+the CLI — all against a fake, deterministic `LLMProvider` so it never needs a running Ollama
+daemon.
 `tests/fixtures/sample_java_repo` is a tiny hand-written 4-class Java project used throughout.
 
 ## Extending RepoBrain
@@ -212,7 +228,21 @@ all against a fake, deterministic `LLMProvider` so it never needs a running Olla
   detail is omitted; per-class method/field lists are also capped individually so one huge class
   can't blow the budget on its own. If you see `ctx.truncated` / a "more detail than fits" log
   warning, raise `llm.num_ctx` (and `llm.timeout_seconds` to match) for more detail per doc.
-  Chunked/hierarchical summarization for very large repos is a natural next step.
+  ARCHITECTURE.md's domain-model fact block (`prompts._render_domain_model`) and layer-breakdown
+  name lists are capped with small **fixed** limits independent of `num_ctx` — they're meant to be
+  a compact fact block, not an exhaustive dump. Beyond that, `ProjectContext.max_detail_chars`
+  (the same budget used to truncate the class-card listing) is now shared across every other
+  variable-length section a prompt builds — README's representative-types list, ARCHITECTURE's
+  layer breakdown/domain model/primary flow/per-class detail (computed as "budget minus whatever
+  the other sections already used," via `_fit_items_to_budget` in `prompts.py`), and SEQUENCE's
+  flow list — rather than each one stacking uncapped content on top of a budget that used to bound
+  only the class-card section. `_fit_items_to_budget` only force-includes an oversized *first* item
+  once per prompt, not once per section/group, since doing it per-group is what let a real 94-file
+  repo's ARCHITECTURE.md prompt blow out to ~2.5x the intended budget even after the first round of
+  fixes — each of API/Service/Data/Unclassified independently force-adding its own first (possibly
+  large) class card regardless of how little budget earlier groups had already used. Chunked/
+  hierarchical summarization for very large repos is a natural next step if fixed +
+  shared-budget capping ever proves insufficient on its own.
 - Dependency resolution is conservative (unambiguous name matches only); ambiguous simple-name
   collisions across packages are silently dropped rather than guessed.
 - Call resolution (for SEQUENCE.md) only tracks receivers that are fields or method parameters —
@@ -228,17 +258,23 @@ all against a fake, deterministic `LLMProvider` so it never needs a running Olla
   `@GET`/`@POST`/...) annotations today; other frameworks fall back to the name-keyword heuristic,
   which is weaker. Extending the recognized annotation sets in `layers.py` (and the route/test
   annotation sets in `docgen/sequence.py`) is the natural way to support another framework.
-- The domain-model structural fallback (any class/record with an instance field, or any enum,
-  once annotation and keyword checks come up empty) is intentionally broad — DTOs, request/
-  response objects, and config-holder classes with plain fields will also get classified as
-  "domain" if they don't match anything more specific first. This trades some over-inclusion for
-  never missing a real domain type; a class made entirely of static members is the one shape
-  reliably excluded.
+- The domain-model structural fallback (a class/record with an instance field, or any enum, once
+  annotation and keyword checks come up empty, and *unless* a method delegates to one of that
+  class's own fields) is intentionally broad — DTOs and request/response objects with plain fields
+  will still get classified as "domain" if they don't match anything more specific first. This
+  trades some over-inclusion for never missing a real domain type. The field-delegation check
+  catches the most common false positive (a field-injected service/DAO with no annotation), but a
+  class that reaches its dependency via `this.field.method()` rather than a bare `field.method()`
+  isn't currently recognized as delegating (see the call-resolution limitation above) and could
+  still be misclassified in that specific case.
 - External-system detection (`analysis/external_systems.py`) only recognizes a fixed list of
-  common JVM ecosystem library prefixes (JDBC/JPA/Hibernate, MongoDB/Redis, Kafka/RabbitMQ,
-  OkHttp/Retrofit/Apache HttpClient, AWS/GCP/Azure SDKs, JavaMail). An integration using something
-  else — an in-house client library, a less common driver — won't be detected; extending
-  `_CATEGORY_PREFIXES` is the way to add more.
+  common JVM ecosystem library prefixes (JDBC/JPA/Hibernate, jOOQ, MyBatis, MongoDB/Redis,
+  Kafka/RabbitMQ, OkHttp/Retrofit/Apache HttpClient, AWS/GCP/Azure SDKs, JavaMail). An integration
+  using something else — an in-house client library, a less common driver — won't be detected;
+  extending `_CATEGORY_PREFIXES` is the way to add more. The "external terminal hop" appended to a
+  sequence diagram only fires when the *deepest resolved class in that specific flow* imports a
+  recognized prefix — a DB access one call deeper than RepoBrain's `MAX_DEPTH`/`MAX_STEPS_PER_FLOW`
+  caps allow tracing won't show a database sink even if one genuinely exists further down.
 - The LLM can still embellish beyond the grounded facts even when instructed not to (e.g.
   inferring a specific state-transition story from an enum's constant names alone) — the prompt
   explicitly warns against this for the domain model section, but an 8B local model won't catch

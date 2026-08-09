@@ -130,6 +130,12 @@ class ProjectContext:
     #: truncation — see `analysis.layers.layer_breakdown`.
     layer_breakdown: dict[str, list[str]]
     truncated: bool
+    #: The same character budget used to bound the class-card listing
+    #: above, exposed so prompt builders can share it across every
+    #: variable-length section they add (layer breakdown, domain model,
+    #: primary flow, ...) instead of each one stacking uncapped content
+    #: on top of a budget that was only ever meant to bound class cards.
+    max_detail_chars: int
 
     def all_class_cards(self) -> list[ClassCard]:
         return [c for pkg in self.package_summaries for c in pkg.classes]
@@ -228,4 +234,5 @@ def build_project_context(
         sequence_flows=build_sequence_flows(repo_ir, index),
         layer_breakdown=layer_breakdown([e.class_info for e in index.by_qualified_name.values()]),
         truncated=truncated,
+        max_detail_chars=max_detail_chars,
     )

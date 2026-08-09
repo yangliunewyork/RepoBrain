@@ -102,6 +102,58 @@ def _annotations_of(node: Node, source: bytes) -> list[str]:
     return result
 
 
+def _string_literal_text(node: Node | None, source: bytes) -> str | None:
+    """Extracts the literal text of a `string_literal` node (its
+    `string_fragment` child/children), or None if `node` isn't one —
+    used to pull a route path like "/products" out of an annotation
+    argument without the surrounding quotes."""
+    if node is None or node.type != "string_literal":
+        return None
+    fragments = [c for c in node.children if c.type == "string_fragment"]
+    if not fragments:
+        return None
+    return "".join(_text(f, source) for f in fragments)
+
+
+def _annotation_args_of(node: Node, source: bytes) -> dict[str, str]:
+    """Best-effort single string argument per annotation, e.g.
+    `@PostMapping("/products")` -> {"PostMapping": "/products"} or
+    `@RequestMapping(value = "/x", ...)` -> {"RequestMapping": "/x"}.
+    Used only to label sequence-diagram entry points with an actual
+    route path — annotations with no string argument (or a more complex
+    one this doesn't recognize) simply have no entry here, which callers
+    must treat as "no path available", not an error.
+    """
+    mods_node = _find_modifiers_node(node)
+    if mods_node is None:
+        return {}
+    result: dict[str, str] = {}
+    for child in mods_node.children:
+        if child.type != "annotation":
+            continue  # marker_annotation (@Foo, no parens) has no args by definition
+        name_node = next((c for c in child.children if c.type in ("identifier", "scoped_identifier")), None)
+        args_node = next((c for c in child.children if c.type == "annotation_argument_list"), None)
+        if name_node is None or args_node is None:
+            continue
+        name = _text(name_node, source).rsplit(".", 1)[-1]
+
+        value = None
+        for arg in args_node.children:
+            if arg.type == "string_literal":
+                value = _string_literal_text(arg, source)
+                break
+            if arg.type == "element_value_pair":
+                key_node = arg.child_by_field_name("key")
+                value_node = arg.child_by_field_name("value")
+                if key_node is not None and _text(key_node, source) in ("value", "path"):
+                    value = _string_literal_text(value_node, source)
+                    if value is not None:
+                        break
+        if value is not None:
+            result[name] = value
+    return result
+
+
 def _type_list_texts(list_node: Node | None, source: bytes) -> list[str]:
     if list_node is None:
         return []
@@ -246,6 +298,7 @@ class JavaParser(LanguageParser):
 
         modifiers = _modifiers_of(node, source)
         annotations = _annotations_of(node, source)
+        annotation_args = _annotation_args_of(node, source)
         type_params = self._parse_type_parameters(node, source)
         extends, implements = self._parse_supertypes(node, kind, source)
 
@@ -255,6 +308,7 @@ class JavaParser(LanguageParser):
             qualified_name=qualified,
             modifiers=modifiers,
             annotations=annotations,
+            annotation_args=annotation_args,
             extends=extends,
             implements=implements,
             type_parameters=type_params,
@@ -352,6 +406,7 @@ class JavaParser(LanguageParser):
         params = _parse_parameters(node.child_by_field_name("parameters"), source)
         modifiers = _modifiers_of(node, source)
         annotations = _annotations_of(node, source)
+        annotation_args = _annotation_args_of(node, source)
         doc = _doc_comment_for(node, source)
 
         calls: list[MethodCall] = []
@@ -366,6 +421,7 @@ class JavaParser(LanguageParser):
             parameters=params,
             modifiers=modifiers,
             annotations=annotations,
+            annotation_args=annotation_args,
             doc_comment=doc,
             is_constructor=is_constructor,
             start_line=node.start_point[0] + 1,

@@ -46,6 +46,11 @@ class MethodInfo:
     #: detection, layer classification) reads this instead of guessing
     #: from the method/class name.
     annotations: list[str] = field(default_factory=list)
+    #: annotation name -> its single string argument, where recognizable,
+    #: e.g. {"PostMapping": "/products"}. Only populated for annotations
+    #: with a bare or `value=`/`path=` string argument; used to label
+    #: sequence-diagram entry points with an actual HTTP route.
+    annotation_args: dict[str, str] = field(default_factory=dict)
     doc_comment: Optional[str] = None
     is_constructor: bool = False
     start_line: int = 0
@@ -79,6 +84,10 @@ class ClassInfo:
     modifiers: list[str] = field(default_factory=list)
     #: Simple annotation names (no `@`, no arguments), e.g. "RestController".
     annotations: list[str] = field(default_factory=list)
+    #: annotation name -> its single string argument, e.g. a class-level
+    #: {"RequestMapping": "/products"} base path — combined with a
+    #: method's own `annotation_args` to build a full route label.
+    annotation_args: dict[str, str] = field(default_factory=dict)
     extends: list[str] = field(default_factory=list)
     implements: list[str] = field(default_factory=list)
     type_parameters: list[str] = field(default_factory=list)
@@ -155,6 +164,7 @@ def _class_from_dict(data: dict) -> ClassInfo:
             parameters=[ParameterInfo(**p) for p in m.get("parameters", [])],
             modifiers=m.get("modifiers", []),
             annotations=m.get("annotations", []),
+            annotation_args=m.get("annotation_args", {}),
             doc_comment=m.get("doc_comment"),
             is_constructor=m.get("is_constructor", False),
             start_line=m.get("start_line", 0),
@@ -171,6 +181,7 @@ def _class_from_dict(data: dict) -> ClassInfo:
         qualified_name=data["qualified_name"],
         modifiers=data.get("modifiers", []),
         annotations=data.get("annotations", []),
+        annotation_args=data.get("annotation_args", {}),
         extends=data.get("extends", []),
         implements=data.get("implements", []),
         type_parameters=data.get("type_parameters", []),

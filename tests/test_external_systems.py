@@ -29,6 +29,18 @@ def test_detects_http_client_import():
     assert result == {"HTTP / REST Client": ["okhttp3"]}
 
 
+def test_detects_jooq_import():
+    repo_ir = _repo_ir({"A.java": "import org.jooq.DSLContext;\npublic class A {}"})
+    result = classify_external_systems(repo_ir)
+    assert result == {"Relational Database": ["org.jooq"]}
+
+
+def test_detects_mybatis_import():
+    repo_ir = _repo_ir({"A.java": "import org.apache.ibatis.session.SqlSession;\npublic class A {}"})
+    result = classify_external_systems(repo_ir)
+    assert result == {"Relational Database": ["org.apache.ibatis"]}
+
+
 def test_detects_cloud_sdk_import():
     repo_ir = _repo_ir({"A.java": "import com.amazonaws.services.s3.AmazonS3;\npublic class A {}"})
     result = classify_external_systems(repo_ir)

@@ -183,3 +183,71 @@ def test_malformed_source_does_not_raise():
     ir = _parse("public class Broken { public void foo( {")
     assert isinstance(ir.parse_errors, list)
     assert ir.parse_errors  # syntax error should be recorded, not raised
+
+
+def test_annotation_arg_extracted_from_bare_string_literal():
+    ir = _parse(
+        """
+        public class WidgetController {
+            @PostMapping("/products")
+            public void create() {}
+        }
+        """
+    )
+    method = ir.classes[0].methods[0]
+    assert method.annotation_args == {"PostMapping": "/products"}
+
+
+def test_annotation_arg_extracted_from_value_named_pair():
+    ir = _parse(
+        """
+        public class WidgetController {
+            @RequestMapping(value = "/x", method = RequestMethod.POST)
+            public void other() {}
+        }
+        """
+    )
+    method = ir.classes[0].methods[0]
+    assert method.annotation_args == {"RequestMapping": "/x"}
+
+
+def test_annotation_arg_extracted_from_path_named_pair():
+    ir = _parse(
+        """
+        public class WidgetController {
+            @Path(path = "/legacy")
+            public void jaxrs() {}
+        }
+        """
+    )
+    method = ir.classes[0].methods[0]
+    assert method.annotation_args == {"Path": "/legacy"}
+
+
+def test_marker_annotation_has_no_args():
+    ir = _parse(
+        """
+        public class WidgetController {
+            @GetMapping
+            public void bare() {}
+        }
+        """
+    )
+    method = ir.classes[0].methods[0]
+    assert method.annotations == ["GetMapping"]
+    assert method.annotation_args == {}
+
+
+def test_class_level_annotation_args_captured_separately_from_method():
+    ir = _parse(
+        """
+        @RequestMapping("/products")
+        public class WidgetController {
+            @PostMapping("/create")
+            public void create() {}
+        }
+        """
+    )
+    cls = ir.classes[0]
+    assert cls.annotation_args == {"RequestMapping": "/products"}
+    assert cls.methods[0].annotation_args == {"PostMapping": "/create"}

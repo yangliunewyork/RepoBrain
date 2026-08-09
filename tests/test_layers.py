@@ -68,6 +68,29 @@ def test_static_only_class_is_not_domain():
     assert classify_layer(info) is None
 
 
+def test_unannotated_service_with_field_delegation_is_not_domain():
+    """A class with a field-injected dependency also "has an instance
+    field," but its methods delegating to that field (not just holding
+    state) is what marks it as a component, not a domain object -- even
+    with no @Service annotation to say so explicitly."""
+    info = _class_info(
+        "public class ProductService { private ProductRepository r; "
+        "public void createProduct() { r.save(); } }"
+    )
+    assert classify_layer(info) is None
+
+
+def test_domain_object_with_internal_jdk_call_is_still_domain():
+    """A value object doing its own light computation (calling a JDK
+    static utility, not delegating to one of its own fields) should
+    still read as domain -- only delegation to a field disqualifies it."""
+    info = _class_info(
+        "public class Money { private long cents; "
+        "public String format() { return String.valueOf(cents); } }"
+    )
+    assert classify_layer(info) == "domain"
+
+
 def test_class_with_no_fields_or_annotations_is_unclassified():
     info = _class_info("public class Utils { public static int add(int a, int b) { return a + b; } }")
     assert classify_layer(info) is None
@@ -154,9 +177,11 @@ def test_component_graph_aggregates_by_layer_not_package():
     assert edges["API"] == {"Service"}
     assert edges["Service"] == {"Data", "Domain"}
     assert edges["Data"] == {"Domain"}
-    # Four distinct packages collapsed into four component nodes, not
-    # four package nodes with the same shape -- the point of the test.
-    assert set(edges.keys()) <= {"API", "Service", "Domain", "Data"}
+    assert edges["Client"] == {"API"}
+    # Four distinct packages collapsed into four component nodes (plus
+    # the synthetic Client), not four package nodes with the same shape
+    # -- the point of the test.
+    assert set(edges.keys()) <= {"API", "Service", "Domain", "Data", "Client"}
 
 
 def test_component_graph_adds_external_system_nodes():
@@ -188,3 +213,43 @@ def test_component_graph_has_no_self_loops():
     edges = component_graph(repo_ir, index, graph)
     # Both A and B are "Service" -- same bucket, so no edge should be recorded.
     assert edges == {}
+
+
+def test_component_graph_adds_client_node_when_api_layer_exists():
+    repo_ir = _repo_ir({"A.java": "@RestController public class A { public void get() {} }"})
+    index = build_symbol_index(repo_ir)
+    graph = build_dependency_graph(repo_ir, index)
+    edges = component_graph(repo_ir, index, graph)
+    assert edges == {"Client": {"API"}}
+
+
+def test_component_graph_has_no_client_node_without_api_layer():
+    repo_ir = _repo_ir({"A.java": "@Service public class A { public void run() {} }"})
+    index = build_symbol_index(repo_ir)
+    graph = build_dependency_graph(repo_ir, index)
+    edges = component_graph(repo_ir, index, graph)
+    assert "Client" not in edges
+
+
+def test_keyword_matching_does_not_false_positive_on_substrings():
+    """Regression test: naive substring matching on the lowercased
+    qualified name let "rest" match inside "Interest"/"Restore" -- a
+    class about financial interest or an object-restore operation isn't
+    an API-layer signal just because its name happens to contain that
+    substring. Word-boundary matching must not misclassify these."""
+    assert classify_layer(_class_info("public class Interest { private double rate; }")) != "api"
+    assert classify_layer(_class_info("public class Restore { private String path; }")) != "api"
+
+
+def test_store_is_not_a_data_layer_keyword():
+    """"store" was removed as a data-layer keyword entirely: it's at
+    least as often a business noun (a retail/e-commerce Store entity,
+    as in a real production repo whose whole domain was literally
+    "stores") as a data-access pattern, and the domain-shape structural
+    fallback already classifies a plain `Store` entity correctly without
+    this keyword's help -- keeping it caused real misclassification."""
+    info = _class_info("public class Store { private String name; }")
+    assert classify_layer(info) == "domain"
+
+    info = _class_info("public class UpdateStoresRequest { private String storeName; }")
+    assert classify_layer(info) == "domain"

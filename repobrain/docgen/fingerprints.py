@@ -51,11 +51,13 @@ def _class_shape(entry: ClassEntry, graph: DependencyGraph) -> dict:
     }
 
 
-def _flow_shape(flow: SequenceFlow) -> dict:
-    return {
-        "entry": f"{flow.entry_class}.{flow.entry_method}",
-        "steps": [f"{s.caller_class}.{s.caller_method}->{s.callee_class}.{s.callee_method}" for s in flow.steps],
-    }
+def _flow_shape(flow: SequenceFlow) -> str:
+    # The rendered Mermaid text already reflects everything that could
+    # possibly change about a flow — call chain, route label, resolved
+    # return types, an appended external-system hop — so hashing it
+    # directly stays automatically correct as `sequence.py`'s rendering
+    # evolves, rather than needing a parallel shape kept in sync by hand.
+    return flow.mermaid
 
 
 def compute_fingerprints(repo_ir: RepoIR, index: SymbolIndex, graph: DependencyGraph) -> dict[str, str]:

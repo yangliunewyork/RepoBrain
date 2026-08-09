@@ -16,6 +16,7 @@ unclassified (`None`) rather than being forced into a guessed bucket.
 """
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 from typing import TYPE_CHECKING, Literal
 
@@ -45,9 +46,33 @@ _DOMAIN_ANNOTATIONS = {"Entity", "Table", "Document", "Embeddable", "MappedSuper
 _DATA_ANNOTATIONS = {"Repository", "Dao"}
 _SERVICE_ANNOTATIONS = {"Service"}
 
-#: Fallback for code with no recognized annotations at all.
+#: Fallback for code with no recognized annotations at all. Matched as
+#: whole *words* against a camelCase/package-segment tokenization of the
+#: qualified name (see `_words_of`), never as a raw substring — "rest"
+#: as a substring would otherwise false-match "Interest"/"Restore", and
+#: a short generic word like this needs the word boundary to be safe.
+#: "store" is deliberately excluded even as a whole word: it's at least
+#: as often a business noun (a retail/e-commerce "Store" domain entity)
+#: as it is a data-access pattern (a "TokenStore"), and the domain-shape
+#: structural fallback below already covers the former correctly without
+#: this keyword's help — keeping it caused a real class named `Store`
+#: (and `UpdateStoresRequest`, via the plural) to be misclassified as
+#: "data" in a production repo whose entire domain was literally stores.
 _API_LAYER_KEYWORDS = ("controller", "endpoint", "resource", "router", "api", "rest", "web")
-_DATA_LAYER_KEYWORDS = ("repository", "repo", "dao", "persistence", "database", "mapper", "store")
+_DATA_LAYER_KEYWORDS = ("repository", "repo", "dao", "persistence", "database", "mapper")
+
+#: Splits "com.example.WidgetDao" into {"com", "example", "widget", "dao"}
+#: — package segments split on ".", class/method names split on
+#: camelCase boundaries — so keyword matching is against whole words,
+#: not an arbitrary substring of the full lowercased name.
+_WORD_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z0-9]+|[A-Z0-9]+")
+
+
+def _words_of(qualified_name: str) -> set[str]:
+    words: set[str] = set()
+    for segment in re.split(r"[.\-_]", qualified_name):
+        words.update(w.lower() for w in _WORD_RE.findall(segment) if w)
+    return words
 
 _LAYER_RANK: dict[Layer | None, int] = {"api": 0, "service": 1, "domain": 2, "data": 3}
 #: Truly unclassified code (utility/config/helper classes with no
@@ -57,21 +82,37 @@ _DEFAULT_RANK = 2
 
 _LAYER_LABELS: dict[Layer | None, str] = {"api": "API", "service": "Service", "domain": "Domain", "data": "Data"}
 _OTHER_LABEL = "Other"
+#: Synthetic node representing whatever originates a request into the
+#: system (a browser, another service, a CLI invocation) — matches the
+#: "Client" participant `docgen.sequence` synthesizes for the same
+#: reason: an architecture diagram that starts at "Controllers" implies
+#: requests appear from nowhere, which isn't how any real system works.
+_CLIENT_LABEL = "Client"
 
 
 def _looks_like_domain_model(class_info: ClassInfo) -> bool:
     """Structural fallback for domain/model types with no framework
     annotation at all (plain POJOs, Java records used as value objects).
     An enum is treated as domain-ish unconditionally (its constants are
-    themselves a business vocabulary, e.g. OrderStatus.SHIPPED); classes
-    and records qualify if they carry at least one *instance* field —
-    static-only fields are how RepoBrain's IR represents a "constants"
-    utility class or a class made entirely of static helpers, neither of
-    which is a domain object.
+    themselves a business vocabulary, e.g. OrderStatus.SHIPPED). A class
+    or record otherwise qualifies if it carries at least one *instance*
+    field (static-only fields are how RepoBrain's IR represents a
+    "constants" utility class, not a domain object) AND none of its
+    methods delegate to one of those fields — a service/controller class
+    with a field-injected dependency (`private WidgetRepository repo;`)
+    also "has an instance field," but what marks it as a component
+    rather than a domain object is that its methods call out to that
+    field (`repo.save(...)`) rather than just holding/exposing state.
     """
     if class_info.kind == "enum":
         return True
-    return any("static" not in f.modifiers for f in class_info.fields)
+    field_names = {f.name for f in class_info.fields if "static" not in f.modifiers}
+    if not field_names:
+        return False
+    delegates_to_a_field = any(
+        call.receiver in field_names for method in class_info.methods for call in method.calls
+    )
+    return not delegates_to_a_field
 
 
 def classify_layer(class_info: ClassInfo) -> Layer | None:
@@ -93,10 +134,10 @@ def classify_layer(class_info: ClassInfo) -> Layer | None:
     if annotations & _SERVICE_ANNOTATIONS:
         return "service"
 
-    lowered = class_info.qualified_name.lower()
-    if any(k in lowered for k in _API_LAYER_KEYWORDS):
+    words = _words_of(class_info.qualified_name)
+    if words & set(_API_LAYER_KEYWORDS):
         return "api"
-    if any(k in lowered for k in _DATA_LAYER_KEYWORDS):
+    if words & set(_DATA_LAYER_KEYWORDS):
         return "data"
 
     if _looks_like_domain_model(class_info):
@@ -162,5 +203,9 @@ def component_graph(
                 for prefix, category in prefix_to_category.items():
                     if imp.path.startswith(prefix):
                         edges[source_bucket].add(category)
+
+    has_api_layer = any(classify_layer(entry.class_info) == "api" for entry in index.by_qualified_name.values())
+    if has_api_layer:
+        edges[_CLIENT_LABEL].add(_LAYER_LABELS["api"])
 
     return dict(edges)

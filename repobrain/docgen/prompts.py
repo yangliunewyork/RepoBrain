@@ -31,7 +31,42 @@ def _render_cards(cards: list[ClassCard], include_dependencies: bool = True) -> 
     return "\n\n".join(c.render(include_dependencies=include_dependencies) for c in cards)
 
 
-def _truncated_list(names: list[str], limit: int = 30) -> str:
+#: Floor so ARCHITECTURE.md's per-class detail section never gets
+#: squeezed to nothing even if the other "verified fact" sections
+#: (layer breakdown, domain model, primary flow) happen to be unusually
+#: large for a given repo — better a small, correctly-bounded amount of
+#: class detail than none at all.
+MIN_CLASS_DETAIL_CHARS = 1500
+
+
+def _fit_items_to_budget(items: list[str], budget: int, force_first: bool = True) -> tuple[str, int, int]:
+    """Joins pre-rendered `items` in order, keeping as many as fit within
+    `budget` characters. Returns (rendered_text, chars_used, num_kept);
+    the caller compares `num_kept` against `len(items)` to know how many
+    (if any) were omitted, and should note that in the surrounding text.
+
+    `force_first`, when true, always keeps the first item even if it
+    alone exceeds `budget`, so a single oversized entry doesn't wipe out
+    the whole section. Pass `False` when calling this repeatedly across
+    several independent groups that share one running budget (see
+    `_render_component_classes`) — force-including a first item in
+    *every* group can compound well past the intended total, since each
+    group's "at least one" guarantee is applied independently of how
+    much budget earlier groups already used.
+    """
+    kept: list[str] = []
+    used = 0
+    for item in items:
+        cost = len(item) + 2  # + blank-line separator
+        fits = used + cost <= budget
+        if not fits and not (force_first and not kept):
+            break
+        kept.append(item)
+        used += cost
+    return "\n\n".join(kept), used, len(kept)
+
+
+def _truncated_list(names: list[str], limit: int = 15) -> str:
     if len(names) <= limit:
         return ", ".join(names)
     return ", ".join(names[:limit]) + f", and {len(names) - limit} more"
@@ -89,6 +124,17 @@ def _render_external_systems(ctx: ProjectContext) -> str:
     return "\n".join(lines)
 
 
+#: Kept deliberately small and fixed rather than scaled to the model's
+#: context window: this section is meant to be a compact "here are the
+#: business nouns" fact block, not an exhaustive dump — the per-class
+#: detail section below already carries the full, budget-aware listing
+#: for every *other* layer. Without a firm cap here, a domain-heavy repo
+#: (e.g. many JPA entities with dozens of columns) can blow the prompt
+#: size out from this one section alone, regardless of `num_ctx`.
+_MAX_DOMAIN_CLASSES_SHOWN = 12
+_MAX_DOMAIN_FIELDS_SHOWN = 6
+
+
 def _render_domain_model(ctx: ProjectContext) -> str:
     domain_cards = ctx.classes_by_layer("domain")
     if not domain_cards:
@@ -98,9 +144,12 @@ def _render_domain_model(ctx: ProjectContext) -> str:
             "or data-carrying shape (a class/record with instance fields, or an enum)."
         )
     lines = ["Business/domain concepts (the nouns this system deals with), with their fields:"]
-    shown = domain_cards[:30]
+    shown = domain_cards[:_MAX_DOMAIN_CLASSES_SHOWN]
     for card in shown:
-        field_list = "; ".join(card.fields) if card.fields else "no fields"
+        fields = card.fields[:_MAX_DOMAIN_FIELDS_SHOWN]
+        field_list = "; ".join(fields) if fields else "no fields"
+        if len(card.fields) > len(fields):
+            field_list += f"; and {len(card.fields) - len(fields)} more fields"
         summary = f" — {card.summary}" if card.summary else ""
         lines.append(f"- **{card.qualified_name}** ({card.kind}): {field_list}{summary}")
     if len(domain_cards) > len(shown):
@@ -114,24 +163,73 @@ def _render_domain_model(ctx: ProjectContext) -> str:
     return "\n".join(lines)
 
 
-def _render_component_classes(ctx: ProjectContext) -> str:
+def _render_component_classes(ctx: ProjectContext, budget: int) -> str:
     """Per-class supporting detail, grouped by verified layer rather than
     by package — the narrative sections this feeds should be organized
     around responsibility the same way, treating this as backing
-    evidence rather than a structure to reproduce."""
+    evidence rather than a structure to reproduce.
+
+    Domain-layer classes are intentionally excluded here: they're
+    already covered, compactly, by `_render_domain_model` — a full
+    `ClassCard.render()` (fields, dependencies, ...) for every domain
+    class as well would just duplicate that section, and domain types
+    are typically the most numerous class of type in any real codebase.
+
+    `budget` bounds this section specifically (see `build_architecture_prompt`,
+    which carves it out of `ctx.max_detail_chars` after accounting for
+    every other "verified fact" section) — it is *not* the same as the
+    budget originally used to decide how many classes made it into
+    `ctx` at all; a repo that already exceeded that first budget can
+    still exceed this second, smaller one, hence the explicit tracking
+    of omitted classes here too.
+    """
+    groups = [(label, ctx.classes_by_layer(layer)) for layer, label in (("api", "API"), ("service", "Service"), ("data", "Data"))]
+    groups.append(("Unclassified", [c for c in ctx.all_class_cards() if c.layer is None]))
+
     sections = []
-    for layer, label in (("api", "API"), ("service", "Service"), ("domain", "Domain"), ("data", "Data")):
-        cards = ctx.classes_by_layer(layer)
-        if cards:
-            sections.append(f"#### {label} layer\n\n{_render_cards(cards)}")
-    other = [c for c in ctx.all_class_cards() if c.layer is None]
-    if other:
-        sections.append(f"#### Unclassified\n\n{_render_cards(other)}")
-    return "\n\n".join(sections)
+    remaining = budget
+    omitted_total = 0
+    rendered_anything = False
+    for label, cards in groups:
+        if not cards:
+            continue
+        if remaining <= 0:
+            omitted_total += len(cards)
+            continue
+        rendered = [c.render() for c in cards]
+        # Only the very first group overall is allowed to force-include
+        # its first card when it alone exceeds the remaining budget —
+        # applying that guarantee independently to *every* group is what
+        # let this section blow past its budget by ~2x on a real repo:
+        # each of API/Service/Data/Unclassified force-adding one
+        # (possibly large) card regardless of how little budget was left.
+        text, used, kept_count = _fit_items_to_budget(rendered, remaining, force_first=not rendered_anything)
+        if text:
+            sections.append(f"#### {label} layer\n\n{text}")
+            remaining -= used
+            rendered_anything = True
+        omitted_total += len(cards) - kept_count
+
+    result = "\n\n".join(sections)
+    if omitted_total:
+        result += f"\n\n... and {omitted_total} more classes not shown in detail due to prompt size limits"
+    return result
 
 
 def build_readme_prompt(ctx: ProjectContext) -> str:
+    # A fixed count cap (25 classes) isn't enough on its own -- a repo
+    # whose public classes happen to carry many fields/methods each can
+    # still produce an oversized prompt at only 25 entries. Bound the
+    # rendered *characters* too, the same way ARCHITECTURE.md's sections
+    # are, using a fraction of the shared detail budget (README's other
+    # sections are small and fixed, so this doesn't need the same
+    # extras-first accounting ARCHITECTURE.md's prompt does).
     top_classes = [c for c in ctx.all_class_cards() if "public" in c.modifiers][:25]
+    rendered = [c.render(include_dependencies=False) for c in top_classes]
+    class_text, _, kept_count = _fit_items_to_budget(rendered, ctx.max_detail_chars // 2)
+    if len(rendered) > kept_count:
+        class_text += f"\n\n... and {len(rendered) - kept_count} more not shown in detail"
+
     external = ", ".join(name for name, _ in ctx.external_packages[:10]) or "none detected"
     truncation_note = (
         "\nNote: this is a large codebase; only a representative subset of classes is listed below."
@@ -151,7 +249,7 @@ Project facts:
 
 Representative public types:
 
-{_render_cards(top_classes, include_dependencies=False)}
+{class_text}
 
 Write a README.md with these sections: a one-paragraph project overview
 (infer the project's purpose from package and class names — be honest
@@ -164,6 +262,27 @@ Keep it concise and skimmable."""
 
 
 def build_architecture_prompt(ctx: ProjectContext) -> str:
+    # `ctx.max_detail_chars` is the same budget context.py used to decide
+    # how many classes made it into `ctx` at all — but every section below
+    # besides the per-class listing (layer breakdown, external systems,
+    # domain model, primary flow, component graph) was, until this fix,
+    # stacked *on top of* that budget rather than sharing it, so a real
+    # repo with many classes and long package/class names could blow the
+    # assembled prompt out to ~2-3x the intended size regardless of
+    # num_ctx. Computing the "extras" first and carving the per-class
+    # section's budget out of what's left keeps the total bounded.
+    layer_breakdown_text = _render_layer_breakdown(ctx)
+    external_systems_text = _render_external_systems(ctx)
+    domain_model_text = _render_domain_model(ctx)
+    primary_flow_text = _render_primary_flow(ctx)
+    component_mermaid_text = ctx.component_mermaid or "graph LR"
+
+    extras_chars = sum(
+        len(t) for t in (layer_breakdown_text, external_systems_text, domain_model_text, primary_flow_text, component_mermaid_text)
+    )
+    class_detail_budget = max(ctx.max_detail_chars - extras_chars, MIN_CLASS_DETAIL_CHARS)
+    component_classes_text = _render_component_classes(ctx, class_detail_budget)
+
     return f"""Generate the content of ARCHITECTURE.md for the repository "{ctx.repo_name}".
 
 Below are several VERIFIED structural facts (from static analysis, not inference), followed
@@ -172,28 +291,28 @@ never hedge on it or re-derive it yourself. Everything else (business capability
 prose descriptions of what a component "does") is your inference from the evidence and
 must read as such, not as another verified fact.
 
-{_render_layer_breakdown(ctx)}
+{layer_breakdown_text}
 
-{_render_external_systems(ctx)}
+{external_systems_text}
 
 Domain model — the business nouns this system deals with:
-{_render_domain_model(ctx)}
+{domain_model_text}
 
 Primary request flow — the highest-confidence entry point, already traced through the
 call graph as a correct Mermaid `sequenceDiagram`:
-{_render_primary_flow(ctx)}
+{primary_flow_text}
 
 VERIFIED FACT — component-level dependency graph (Mermaid; nodes are architectural
 components and external systems, NOT individual packages or classes — a `-->` edge means
 the source component depends on / calls into the target):
 ```mermaid
-{ctx.component_mermaid or 'graph LR'}
+{component_mermaid_text}
 ```
 
 Supporting per-class detail, grouped by the verified layer classification above (use this
 as backing evidence for your prose — do not restructure your document around packages):
 
-{_render_component_classes(ctx)}
+{component_classes_text}
 
 ---
 
@@ -227,17 +346,32 @@ Be precise and avoid speculation not grounded in the evidence above."""
 
 def _render_one_flow(flow) -> str:
     entry = f"{flow.entry_class}.{flow.entry_method}()"
-    steps = "\n".join(
-        f"  {i + 1}. {s.caller_class}.{s.caller_method}() calls {s.callee_class}.{s.callee_method}()"
-        for i, s in enumerate(flow.steps)
+    lines = [f"  1. Client calls {entry}"]
+    for i, s in enumerate(flow.steps, start=2):
+        lines.append(f"  {i}. {s.caller_class}.{s.caller_method}() calls {s.callee_class}.{s.callee_method}()")
+    steps = "\n".join(lines)
+    return (
+        f"Flow starting when a client calls {entry}:\n{steps}\n"
+        "(the Mermaid diagram below also shows the full return trip back to Client, "
+        "including any external system reached at the end — reproduce it exactly)\n"
+        f"```mermaid\n{flow.mermaid}\n```"
     )
-    return f"Flow starting at {entry}:\n{steps}\n```mermaid\n{flow.mermaid}\n```"
 
 
 def _render_sequence_flows(ctx: ProjectContext) -> str:
     if not ctx.sequence_flows:
         return "(No resolvable multi-class call flows were found — the codebase may be too simple, or calls go through receivers that can't be statically resolved to a project class, such as local variables.)"
-    return "\n\n".join(_render_one_flow(flow) for flow in ctx.sequence_flows)
+    # Bounded the same way ARCHITECTURE.md's class-card section is: a
+    # repo with long package/class names and deep call chains can make
+    # even a handful of flows (each already capped by MAX_STEPS_PER_FLOW)
+    # add up to a prompt far larger than `max_detail_chars` intends,
+    # since that cap is on step *count*, not rendered character length.
+    rendered = [_render_one_flow(flow) for flow in ctx.sequence_flows]
+    text, _, kept_count = _fit_items_to_budget(rendered, ctx.max_detail_chars)
+    omitted = len(rendered) - kept_count
+    if omitted:
+        text += f"\n\n... and {omitted} more flow(s) not shown due to prompt size limits"
+    return text
 
 
 def _render_primary_flow(ctx: ProjectContext) -> str:
@@ -251,8 +385,8 @@ def build_sequence_prompt(ctx: ProjectContext) -> str:
     return f"""Generate the content of SEQUENCE.md for the repository "{ctx.repo_name}": a set of
 sequence diagrams for its most significant call flows.
 
-Below are {len(ctx.sequence_flows)} call flows, each already rendered as a correct Mermaid
-`sequenceDiagram` block from statically resolved method calls, along with the same
+Below are this repository's most significant call flows, each already rendered as a correct
+Mermaid `sequenceDiagram` block from statically resolved method calls, along with the same
 information as a plain numbered step list. Entry points were chosen as public methods
 that aren't themselves called elsewhere in the codebase and that make the most outgoing
 calls — a heuristic for "likely meaningful workflow", not a guarantee.

@@ -126,7 +126,7 @@ def test_participants_ordered_left_to_right_by_api_service_data_layer():
     )
     assert len(flows) == 1
     order = _participant_order(flows[0].mermaid)
-    assert order == ["OrderController", "OrderService", "OrderRepository"]
+    assert order == ["Client", "OrderController", "OrderService", "OrderRepository"]
 
 
 def test_layer_order_wins_over_raw_call_order():
@@ -220,3 +220,134 @@ def test_empty_mermaid_for_entry_with_no_steps_is_not_produced():
     # since entry selection requires at least one outgoing call
     flows = _flows({"A.java": "public class A { public void run() {} }"})
     assert all(f.steps for f in flows)
+
+
+def test_getter_call_on_request_dto_is_not_shown_as_a_step():
+    """Regression test for a real production example: a controller
+    reading fields off a request DTO (`request.getStoreName()`) to
+    build another object looked, in the diagram, exactly like the
+    controller calling out to that DTO for information -- when it's
+    really just the controller manipulating its own local data. Only
+    the real hop to the service should appear."""
+    flows = _flows(
+        {
+            "StoreController.java": (
+                "public class StoreController { private StoreService service; "
+                "public void update(UpdateStoresRequest request) { "
+                "String name = request.getStoreName(); "
+                "service.updateStore(name); } }"
+            ),
+            "UpdateStoresRequest.java": (
+                "public class UpdateStoresRequest { private String storeName; "
+                "public String getStoreName() { return storeName; } }"
+            ),
+            "StoreService.java": "public class StoreService { public void updateStore(String name) {} }",
+        }
+    )
+    assert len(flows) == 1
+    steps = flows[0].steps
+    assert not any(s.callee_class == "UpdateStoresRequest" for s in steps)
+    assert any(s.callee_class == "StoreService" and s.callee_method == "updateStore" for s in steps)
+
+
+def test_builder_call_on_domain_object_is_not_shown_as_a_step():
+    flows = _flows(
+        {
+            "StoreController.java": (
+                "public class StoreController { private StoreService service; "
+                "public void update() { Store store = Store.builder(); service.save(store); } }"
+            ),
+            "Store.java": "public class Store { private String name; public static Store builder() { return new Store(); } }",
+            "StoreService.java": "public class StoreService { public void save(Store s) {} }",
+        }
+    )
+    assert len(flows) == 1
+    steps = flows[0].steps
+    assert not any(s.callee_class == "Store" for s in steps)
+    assert any(s.callee_class == "StoreService" for s in steps)
+
+
+def test_call_on_unannotated_unclassified_collaborator_is_still_shown():
+    """The domain filter must be a deny-list, not an allow-list: a real
+    collaborator class with no recognized annotation and no layer-
+    suggestive name (so `classify_layer` returns None, not "domain")
+    must still show up as a genuine step -- most hand-written Java
+    isn't fully annotated."""
+    flows = _flows(
+        {
+            "A.java": "public class A { private Helper h; public void run() { h.doWork(); } }",
+            "Helper.java": "public class Helper { public void doWork() {} }",
+        }
+    )
+    assert len(flows) == 1
+    assert any(s.callee_class == "Helper" and s.callee_method == "doWork" for s in flows[0].steps)
+
+
+def test_self_call_on_domain_classified_class_is_still_shown():
+    """A class calling one of its own other methods is internal
+    delegation, not a cross-component hop -- the domain-vs-component
+    question doesn't apply, so it must never be filtered even if the
+    class itself happens to classify as domain."""
+    flows = _flows(
+        {
+            "Money.java": (
+                "public class Money { private long cents; "
+                "public String describe() { return format(); } "
+                "public String format() { return String.valueOf(cents); } }"
+            ),
+        }
+    )
+    assert len(flows) == 1
+    assert any(s.callee_method == "format" for s in flows[0].steps)
+
+
+def test_trace_continues_through_sole_implementation_of_an_interface():
+    """Regression test for a real production example: a controller
+    calls a service through its interface type (the standard Spring
+    pattern: `private final ProductService productService;` field typed
+    as the interface). The interface's own method has no body -- nothing
+    to trace -- so the flow used to go dark right after the controller,
+    completely missing the real implementation's call into the
+    repository. With exactly one implementation in the project, tracing
+    must continue through it."""
+    flows = _flows(
+        {
+            "StoreController.java": (
+                "public class StoreController { private ProductService productService; "
+                "public void create() { productService.createProduct(); } }"
+            ),
+            "ProductService.java": "public interface ProductService { void createProduct(); }",
+            "ProductServiceImpl.java": (
+                "public class ProductServiceImpl implements ProductService { private ProductRepository repo; "
+                "public void createProduct() { repo.save(); } }"
+            ),
+            "ProductRepository.java": "public class ProductRepository { public void save() {} }",
+        }
+    )
+    entry_flow = next(f for f in flows if f.entry_class == "StoreController")
+    callees = [(s.callee_class, s.callee_method) for s in entry_flow.steps]
+    assert ("ProductServiceImpl", "createProduct") in callees
+    assert ("ProductRepository", "save") in callees
+    # No dangling interface reference left in the trace -- the step that
+    # would have named the interface is rewritten to the implementation
+    # so the diagram stays fully connected (no phantom disconnected hop).
+    assert not any(c == "ProductService" for c, _ in callees)
+
+
+def test_trace_stops_at_interface_with_multiple_implementations():
+    """Redirecting through a *single* implementation is safe; redirecting
+    through one of *several* would be guessing which one is actually
+    injected at runtime. Must not guess -- leave the trace stopping at
+    the interface rather than picking arbitrarily."""
+    flows = _flows(
+        {
+            "A.java": "public class A { private Greeter g; public void run() { g.greet(); } }",
+            "Greeter.java": "public interface Greeter { void greet(); }",
+            "EnglishGreeter.java": "public class EnglishGreeter implements Greeter { private Logger l; public void greet() { l.log(); } }",
+            "FrenchGreeter.java": "public class FrenchGreeter implements Greeter { private Logger l; public void greet() { l.log(); } }",
+            "Logger.java": "public class Logger { public void log() {} }",
+        }
+    )
+    entry_flow = next(f for f in flows if f.entry_class == "A")
+    callees = [(s.callee_class, s.callee_method) for s in entry_flow.steps]
+    assert callees == [("Greeter", "greet")]  # stops here; does not guess English vs French

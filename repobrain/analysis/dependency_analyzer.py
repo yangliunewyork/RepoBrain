@@ -145,8 +145,12 @@ def external_package_usage(repo_ir: RepoIR, top_n: int = 15) -> list[tuple[str, 
     return counter.most_common(top_n)
 
 
-def to_mermaid(pkg_edges: dict[str, set[str]]) -> str:
-    lines = ["graph LR"]
+def to_mermaid(pkg_edges: dict[str, set[str]], orientation: str = "TD") -> str:
+    """Renders a Mermaid `graph` block from an edge dict. Defaults to
+    top-down (`TD`) — matches the conventional "request flows downward
+    through layers" reading of an architecture diagram; pass `"LR"` for
+    a left-to-right layout instead."""
+    lines = [f"graph {orientation}"]
     seen_nodes: set[str] = set()
 
     def node_id(pkg: str) -> str:
