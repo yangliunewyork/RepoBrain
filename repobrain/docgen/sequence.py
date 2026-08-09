@@ -50,7 +50,7 @@ from repobrain.analysis.dependency_analyzer import resolve_type_reference
 from repobrain.analysis.external_systems import classify_external_systems
 from repobrain.analysis.layers import Layer, classify_layer, layer_rank
 from repobrain.analysis.symbol_extractor import SymbolIndex
-from repobrain.ir.models import MethodInfo, RepoIR
+from repobrain.ir.models import ClassInfo, MethodInfo, RepoIR
 
 #: How many flows to surface at all. Kept small — each becomes a full
 #: diagram plus prose in the generated doc.
@@ -68,7 +68,7 @@ EntryKey = tuple[str, str]  # (caller_class qualified name, method name)
 #: else calls it." When present, these methods are preferred as flow
 #: starting points over the generic heuristic below — the annotation
 #: *is* the entry point, not a proxy for one.
-_ROUTE_ANNOTATIONS = {
+ROUTE_ANNOTATIONS = {
     "GetMapping", "PostMapping", "PutMapping", "DeleteMapping", "PatchMapping",
     "RequestMapping", "GET", "POST", "PUT", "DELETE", "PATCH",  # JAX-RS
 }
@@ -81,6 +81,19 @@ _ANNOTATION_HTTP_VERBS = {
     "DeleteMapping": "DELETE", "PatchMapping": "PATCH",
     "GET": "GET", "POST": "POST", "PUT": "PUT", "DELETE": "DELETE", "PATCH": "PATCH",
 }
+
+
+def is_route_handler(class_info: ClassInfo) -> bool:
+    """True if this class carries a recognized route/handler annotation
+    on itself or any of its methods — a verified "this hosts an entry
+    point" signal, reusable anywhere a stronger-than-layer-classification
+    entry-point check is useful (e.g. `docgen.context`'s importance
+    scoring, which wants to prioritize entry-point classes specifically,
+    not just anything classified as the broader "api" layer).
+    """
+    if set(class_info.annotations) & ROUTE_ANNOTATIONS:
+        return True
+    return any(set(m.annotations) & ROUTE_ANNOTATIONS for m in class_info.methods)
 
 #: Method-level annotations marking test code, excluded from entry-point
 #: candidacy even if a test file slips past the default exclude_patterns
@@ -149,7 +162,7 @@ def _route_label(qname: str, method_name: str, index: SymbolIndex) -> str | None
     if method is None:
         return None
 
-    route_annotation = next((a for a in method.annotations if a in _ROUTE_ANNOTATIONS), None)
+    route_annotation = next((a for a in method.annotations if a in ROUTE_ANNOTATIONS), None)
     if route_annotation is None:
         return None
 
@@ -157,7 +170,7 @@ def _route_label(qname: str, method_name: str, index: SymbolIndex) -> str | None
     method_path = method.annotation_args.get(route_annotation, "")
     class_path = ""
     if entry is not None:
-        class_annotation = next((a for a in entry.class_info.annotations if a in _ROUTE_ANNOTATIONS), None)
+        class_annotation = next((a for a in entry.class_info.annotations if a in ROUTE_ANNOTATIONS), None)
         if class_annotation is not None:
             class_path = entry.class_info.annotation_args.get(class_annotation, "")
 
@@ -193,7 +206,7 @@ def _select_entry_points(repo_ir: RepoIR, grouped: dict[EntryKey, list[CallEdge]
                 if not outgoing:
                     continue
                 is_pure_entry = key not in called_targets
-                has_route_annotation = bool(set(method.annotations) & _ROUTE_ANNOTATIONS)
+                has_route_annotation = bool(set(method.annotations) & ROUTE_ANNOTATIONS)
                 candidates.append((key, len(outgoing), is_pure_entry, has_route_annotation))
 
     # Prefer, in order: (1) a verified route/handler annotation -- not a

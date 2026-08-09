@@ -13,7 +13,7 @@ from repobrain.analysis.dependency_analyzer import DependencyGraph, external_pac
 from repobrain.analysis.external_systems import classify_external_systems
 from repobrain.analysis.layers import classify_layer, component_graph, layer_breakdown
 from repobrain.analysis.symbol_extractor import ClassEntry, SymbolIndex
-from repobrain.docgen.sequence import SequenceFlow, build_sequence_flows
+from repobrain.docgen.sequence import SequenceFlow, build_sequence_flows, is_route_handler
 from repobrain.ir.models import ClassInfo, RepoIR
 
 #: Absolute hard cap on how many classes ever get full detail, regardless
@@ -74,6 +74,13 @@ class ClassCard:
     #: — verified from framework annotations (or a name-keyword fallback),
     #: not left for the LLM to infer.
     layer: str | None = None
+    #: How architecturally central this class is — see `_compute_importance`.
+    #: Drives which classes survive truncation first, both in the primary
+    #: per-layer selection below and in `docgen.prompts._render_component_classes`'s
+    #: secondary, doc-specific pass: the classes dropped when a budget
+    #: runs out should be the least important ones, not just whichever
+    #: happened to sort last alphabetically.
+    importance: float = 0.0
 
     def render(self, include_dependencies: bool = True) -> str:
         lines = [f"### {self.kind} {self.qualified_name}"]
@@ -158,6 +165,101 @@ def _capped(items: list[str], limit: int) -> list[str]:
     return items[:limit] + [f"... ({len(items) - limit} more not shown)"]
 
 
+#: Weights for `_compute_importance`. Fan-in ("how many things depend on
+#: me") is weighted above fan-out ("how many things I depend on") since
+#: it's the stronger signal of architectural centrality — a class lots of
+#: other code relies on is more load-bearing than one that merely calls
+#: a lot of things. The entry-point bonus is a flat addition rather than
+#: another multiplier: entry points (controllers, handlers) often have
+#: near-zero fan-in (nothing in the codebase calls them — the framework
+#: does, from outside) but are still exactly the classes a reader needs
+#: to see first, so their importance can't depend on fan-in alone.
+_FAN_IN_WEIGHT = 3
+_FAN_OUT_WEIGHT = 1
+_ENTRY_POINT_BONUS = 15
+
+
+def _compute_importance(info: ClassInfo, graph: DependencyGraph) -> float:
+    """How architecturally central a class is, from signals that are
+    computed, not guessed: fan-in/fan-out on the *raw* dependency graph
+    (not the display-capped lists on `ClassCard` — a class with 200
+    dependents must still outrank one with 2, which capping both to the
+    same shown-list length would otherwise hide), plus a bonus for
+    classes that verifiably host an entry point (a route/handler
+    annotation — see `docgen.sequence.is_route_handler`).
+    """
+    fan_in = len(graph.dependents_of(info.qualified_name))
+    fan_out = len(graph.dependencies_of(info.qualified_name))
+    score = fan_in * _FAN_IN_WEIGHT + fan_out * _FAN_OUT_WEIGHT
+    if is_route_handler(info):
+        score += _ENTRY_POINT_BONUS
+    return score
+
+
+def select_with_group_coverage(
+    groups: list[tuple[str, list[ClassCard]]], budget: int, max_count: int | None = None
+) -> tuple[dict[str, list[ClassCard]], int]:
+    """Selects which cards to keep across several groups (e.g. layers),
+    guaranteeing every non-empty group at least one card — its most
+    important, even if it alone exceeds that group's fair share — by
+    giving each group its own even slice of `budget` up front, with
+    unused slack from earlier groups carried forward to later ones.
+    Groups are processed in the order given, so pass them pre-ordered if
+    a particular tie-breaking order matters. Within each group, cards
+    are ranked by `ClassCard.importance` descending.
+
+    `max_count`, if given, is likewise split evenly across groups (with
+    the same carry-forward), bounding total *class count* the way
+    `budget` bounds total *character count* — a defensive backstop for
+    many packages/layers each holding just one tiny class, where char
+    budget alone wouldn't meaningfully limit how many classes pile up.
+
+    Returns (kept_by_label, omitted_count) — a group with everything
+    dropped is simply absent from `kept_by_label` rather than present
+    with an empty list. This is the one selection mechanism shared by
+    `build_project_context` (primary pass, across all docs) and
+    `docgen.prompts._render_component_classes` (secondary, tighter pass
+    specific to ARCHITECTURE.md) — using it in both places is what keeps
+    a layer from being starved at one stage in a way the other stage can
+    no longer recover from.
+    """
+    groups = [(label, cards) for label, cards in groups if cards]
+    if not groups:
+        return {}, 0
+
+    per_group_budget = max(budget // len(groups), 1)
+    per_group_count = max(max_count // len(groups), 1) if max_count is not None else None
+
+    kept_by_label: dict[str, list[ClassCard]] = {}
+    omitted = 0
+    chars_leftover = 0
+    count_leftover = 0
+    for label, cards in groups:
+        ranked = sorted(cards, key=lambda c: (-c.importance, c.qualified_name))
+        group_budget = per_group_budget + chars_leftover
+        group_count_limit = (per_group_count + count_leftover) if per_group_count is not None else None
+
+        used = 0
+        group_kept: list[ClassCard] = []
+        for card in ranked:
+            if group_count_limit is not None and len(group_kept) >= group_count_limit:
+                break
+            cost = len(card.render()) + 2
+            if group_kept and used + cost > group_budget:
+                break
+            group_kept.append(card)
+            used += cost
+
+        if group_kept:
+            kept_by_label[label] = group_kept
+        omitted += len(cards) - len(group_kept)
+        chars_leftover = max(group_budget - used, 0)
+        if group_count_limit is not None:
+            count_leftover = max(group_count_limit - len(group_kept), 0)
+
+    return kept_by_label, omitted
+
+
 def _build_class_card(entry: ClassEntry, graph: DependencyGraph) -> ClassCard:
     info: ClassInfo = entry.class_info
     fields = _capped([f"{f.type} {f.name}" for f in info.fields], MAX_FIELDS_PER_CARD)
@@ -177,7 +279,13 @@ def _build_class_card(entry: ClassEntry, graph: DependencyGraph) -> ClassCard:
         depends_on=depends_on,
         depended_on_by=depended_on_by,
         layer=classify_layer(info),
+        importance=_compute_importance(info, graph),
     )
+
+
+_LAYER_GROUPS: tuple[tuple[str, str], ...] = (
+    ("api", "API"), ("service", "Service"), ("domain", "Domain"), ("data", "Data"),
+)
 
 
 def build_project_context(
@@ -190,36 +298,34 @@ def build_project_context(
 ) -> ProjectContext:
     total_classes = len(index.by_qualified_name)
 
-    # Split the budget evenly across packages up front, rather than
-    # first-come-first-served, so a handful of huge early packages can't
-    # starve every package that sorts after them — while still keeping the
-    # *total* bounded to roughly max_detail_chars regardless of package count.
-    num_packages = max(len(index.by_package), 1)
-    per_package_budget = max(max_detail_chars // num_packages, 1)
+    # Every class gets a full card up front — cheap (field/list
+    # construction, no truncation decision yet) — so the primary
+    # selection below can see the whole repository, not just whatever an
+    # earlier package-level pass happened to keep. Package structure is
+    # deliberately *not* the primary selection axis: a layer's classes
+    # can be scattered thinly across many packages, and truncating by
+    # package first can zero out an entire layer before layer-based
+    # logic ever gets a chance to notice, let alone protect it.
+    all_cards = [_build_class_card(entry, graph) for entry in index.by_qualified_name.values()]
+    cards_by_layer: dict[str | None, list[ClassCard]] = {}
+    for card in all_cards:
+        cards_by_layer.setdefault(card.layer, []).append(card)
+
+    groups = [(label, cards_by_layer.get(layer, [])) for layer, label in _LAYER_GROUPS]
+    groups.append(("Unclassified", cards_by_layer.get(None, [])))
+
+    kept_by_label, omitted = select_with_group_coverage(groups, max_detail_chars, max_count=MAX_CLASSES_IN_DETAIL)
+    selected_by_qname = {c.qualified_name: c for cards in kept_by_label.values() for c in cards}
 
     package_summaries: list[PackageSummary] = []
-    detailed_count = 0
     for package, entries in sorted(index.by_package.items()):
-        cards = []
-        remaining_chars = per_package_budget
-        for entry in sorted(entries, key=lambda e: e.class_info.qualified_name):
-            if detailed_count >= MAX_CLASSES_IN_DETAIL:
-                break
-            # Always include at least one class per package so every
-            # package gets some representation, even if that one class
-            # alone exceeds this package's share of the budget.
-            if cards and remaining_chars <= 0:
-                break
-            card = _build_class_card(entry, graph)
-            rendered_len = len(card.render())
-            if cards and rendered_len > remaining_chars:
-                break
-            cards.append(card)
-            remaining_chars -= rendered_len
-            detailed_count += 1
-        package_summaries.append(PackageSummary(name=package or "(default package)", class_count=len(entries), classes=cards))
+        classes = sorted(
+            (selected_by_qname[e.class_info.qualified_name] for e in entries if e.class_info.qualified_name in selected_by_qname),
+            key=lambda c: c.qualified_name,
+        )
+        package_summaries.append(PackageSummary(name=package or "(default package)", class_count=len(entries), classes=classes))
 
-    truncated = detailed_count < total_classes
+    truncated = omitted > 0
 
     external_systems = classify_external_systems(repo_ir)
     return ProjectContext(

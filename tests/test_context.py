@@ -40,17 +40,47 @@ def test_large_repo_is_truncated_to_fit_char_budget():
     assert total_rendered_chars < 20_000  # bounded, not proportional to 200 classes
 
 
-def test_every_package_gets_at_least_one_class_even_under_tight_budget():
-    repo_ir_a = _repo_ir(1, methods_per_class=200)  # one huge class
+def test_package_class_count_stays_accurate_even_when_truncated_to_zero_detail():
+    """Package coverage is no longer the primary guarantee -- layer
+    coverage is (see `test_every_nonempty_layer_gets_representation_even_when_one_dominates`
+    in test_prompts.py) -- so a package whose only class loses out
+    within its *layer's* internal competition can legitimately end up
+    with zero detailed classes shown. `class_count` must still be
+    accurate regardless, since it's not subject to truncation at all."""
+    repo_ir_a = _repo_ir(1, methods_per_class=200)  # one huge, unclassified class in package "p"
     parser = JavaParser()
-    src_b = "package q; public class Small {}"
+    src_b = "package q; public class Small {}"  # tiny, also unclassified -- same layer group as above
     repo_ir_a.files["Small.java"] = parser.parse("Small.java", src_b.encode("utf-8"))
 
     index = build_symbol_index(repo_ir_a)
     graph = build_dependency_graph(repo_ir_a, index)
     ctx = build_project_context("repo", repo_ir_a, index, graph, ["java"], max_detail_chars=200)
 
-    assert all(pkg.classes for pkg in ctx.package_summaries)
+    counts = {pkg.name: pkg.class_count for pkg in ctx.package_summaries}
+    assert counts == {"p": 1, "q": 1}
+
+
+def test_every_nonempty_layer_gets_at_least_one_class_in_project_context():
+    """The primary coverage guarantee now lives here, in
+    `build_project_context` itself, not just in ARCHITECTURE.md's
+    secondary prompts.py pass -- a layer starved at this first, wider
+    stage could never be recovered by a later, narrower one."""
+    sources = {
+        "BigApi.java": "@RestController public class BigApi { "
+        + " ".join(f"public void m{i}() {{}}" for i in range(80))
+        + " }",
+        "Svc1.java": "@Service public class Svc1 { public void run() {} }",
+        "Data1.java": "@Repository public class Data1 { public void save() {} }",
+    }
+    parser = JavaParser()
+    files = {path: parser.parse(path, src.encode("utf-8")) for path, src in sources.items()}
+    repo_ir = RepoIR(repo_root="/repo", generated_at=datetime.now(timezone.utc).isoformat(), files=files)
+    index = build_symbol_index(repo_ir)
+    graph = build_dependency_graph(repo_ir, index)
+    ctx = build_project_context("repo", repo_ir, index, graph, ["java"], max_detail_chars=300)
+
+    layers_present = {c.layer for c in ctx.all_class_cards()}
+    assert layers_present == {"api", "service", "data"}
 
 
 def test_methods_capped_on_a_single_oversized_class():

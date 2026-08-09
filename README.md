@@ -195,16 +195,17 @@ Copy `config/repobrain.example.yaml` into a target repo and pass `--config` to o
 pytest
 ```
 
-The suite (145 tests) covers the scanner (including default test-source exclusion and a
+The suite (164 tests) covers the scanner (including default test-source exclusion and a
 regression test for a glob-matching edge case in top-level directory excludes), the Java parser
 (generics, nested classes, enums, records, malformed source, call-site extraction, annotation and
 annotation-argument extraction), the dependency graph, layer/domain classification (including the
 field-delegation refinement that keeps a field-injected service from being misread as a domain
 object) and the component graph, external-system detection, the call graph and sequence-diagram
 selection/tracing/round-trip rendering (Client participant, route labels, return arrows, external
-terminal hops, layer-ordering), git-diff-based change detection, the fingerprint/skip logic, and
-the CLI — all against a fake, deterministic `LLMProvider` so it never needs a running Ollama
-daemon.
+terminal hops, layer-ordering), importance scoring and coverage-aware/layer-primary class selection
+(including a direct reproduction of a real production repo silently dropping an entire layer's
+detail), git-diff-based change detection, the fingerprint/skip logic, and the CLI — all against a
+fake, deterministic `LLMProvider` so it never needs a running Ollama daemon.
 `tests/fixtures/sample_java_repo` is a tiny hand-written 4-class Java project used throughout.
 
 ## Extending RepoBrain
@@ -222,27 +223,32 @@ daemon.
 
 - Java only; the IR and pipeline are language-agnostic but only `JavaParser` exists today.
 - Large repositories are truncated to fit a character budget derived from `llm.num_ctx`
-  (`char_budget_for_num_ctx` in `repobrain/docgen/context.py`), split evenly across packages so no
-  single large package starves the rest — with a hard ceiling of `MAX_CLASSES_IN_DETAIL` (150)
-  classes regardless. Beyond that, package summaries still get accurate counts, but per-class
-  detail is omitted; per-class method/field lists are also capped individually so one huge class
-  can't blow the budget on its own. If you see `ctx.truncated` / a "more detail than fits" log
-  warning, raise `llm.num_ctx` (and `llm.timeout_seconds` to match) for more detail per doc.
-  ARCHITECTURE.md's domain-model fact block (`prompts._render_domain_model`) and layer-breakdown
-  name lists are capped with small **fixed** limits independent of `num_ctx` — they're meant to be
-  a compact fact block, not an exhaustive dump. Beyond that, `ProjectContext.max_detail_chars`
-  (the same budget used to truncate the class-card listing) is now shared across every other
-  variable-length section a prompt builds — README's representative-types list, ARCHITECTURE's
-  layer breakdown/domain model/primary flow/per-class detail (computed as "budget minus whatever
-  the other sections already used," via `_fit_items_to_budget` in `prompts.py`), and SEQUENCE's
-  flow list — rather than each one stacking uncapped content on top of a budget that used to bound
-  only the class-card section. `_fit_items_to_budget` only force-includes an oversized *first* item
-  once per prompt, not once per section/group, since doing it per-group is what let a real 94-file
-  repo's ARCHITECTURE.md prompt blow out to ~2.5x the intended budget even after the first round of
-  fixes — each of API/Service/Data/Unclassified independently force-adding its own first (possibly
-  large) class card regardless of how little budget earlier groups had already used. Chunked/
-  hierarchical summarization for very large repos is a natural next step if fixed +
-  shared-budget capping ever proves insufficient on its own.
+  (`char_budget_for_num_ctx` in `repobrain/docgen/context.py`). Selection is coverage-aware and
+  importance-ranked rather than first-come-first-served: `build_project_context` groups every class
+  by **architectural layer** (API/Service/Domain/Data/Unclassified) — not by package, since a
+  layer's classes can be scattered thinly across many packages, and truncating by package first
+  could zero out an entire layer before layer-based logic ever got a chance to protect it — gives
+  each non-empty layer its own even slice of the budget up front (via the shared
+  `select_with_group_coverage` helper, also reused by ARCHITECTURE.md's own tighter, doc-specific
+  second pass), and ranks classes within each layer by `ClassCard.importance`: fan-in/fan-out on the
+  raw dependency graph, plus a bonus for classes that verifiably host an HTTP/RPC entry point
+  (`docgen.sequence.is_route_handler`). Unused budget from a smaller layer carries forward to the
+  next, so every non-empty layer is guaranteed at least its single most important class shown, even
+  if that class alone exceeds its fair share. Package structure remains an *underlying* mechanism —
+  `PackageSummary.class_count` is always accurate for the overview regardless of which classes got
+  full detail — but is no longer the primary axis truncation is guaranteed against; a package whose
+  only class loses out within its layer's internal competition can end up with zero detailed classes
+  shown, the same way a layer used to lose out entirely under the old package-primary design, just
+  now confined to the package axis (an accepted tradeoff) rather than the layer axis (the thing this
+  redesign exists to prevent). `MAX_CLASSES_IN_DETAIL` (150) remains a
+  hard, layer-sliced ceiling regardless of character budget, and per-class method/field lists are
+  still capped individually so one huge class can't blow its own budget on its own. If you see
+  `ctx.truncated` / a "more detail than fits" log warning, raise `llm.num_ctx` (and
+  `llm.timeout_seconds` to match) for more detail per doc. ARCHITECTURE.md's domain-model fact block
+  (`prompts._render_domain_model`) and layer-breakdown name lists are capped with small **fixed**
+  limits independent of `num_ctx` — they're meant to be a compact fact block, not an exhaustive dump.
+  Chunked/hierarchical summarization for very large repos is a natural next step if coverage-aware,
+  importance-ranked truncation ever proves insufficient on its own.
 - Dependency resolution is conservative (unambiguous name matches only); ambiguous simple-name
   collisions across packages are silently dropped rather than guessed.
 - Call resolution (for SEQUENCE.md) only tracks receivers that are fields or method parameters —

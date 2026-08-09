@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 
 from repobrain.analysis import build_dependency_graph, build_symbol_index
 from repobrain.docgen.context import build_project_context, char_budget_for_num_ctx
-from repobrain.docgen.prompts import _fit_items_to_budget, build_architecture_prompt
+from repobrain.docgen.prompts import _fit_items_to_budget, build_architecture_prompt, build_readme_prompt
 from repobrain.ir.models import RepoIR
 from repobrain.parsing.java_parser import JavaParser
 
@@ -99,16 +99,25 @@ def test_fit_items_to_budget_force_first_only_applies_when_requested():
     assert used == 0
 
 
+def _component_classes_section(prompt: str) -> str:
+    """Extract just the "Supporting per-class detail" section (it runs
+    up to the "---" separator before the instructions), to measure or
+    inspect it in isolation from the rest of the architecture prompt."""
+    return prompt.split("Supporting per-class detail")[1].split("\n---")[0]
+
+
 def test_component_classes_budget_is_not_compounded_across_layer_groups():
     """Regression test: `_render_component_classes` used to guarantee
     "at least one card" independently for *each* of API/Service/Data/
-    Unclassified, so on a real repo with substantial classes in every
-    layer, each group force-included its own oversized first card
-    regardless of how little budget earlier groups had already used --
-    compounding to ~2x the intended total on a real 94-file repository.
-    A single class here is deliberately large (many fields) relative to
-    a tight budget, and appears in three different layers, to reproduce
-    that compounding shape directly.
+    Unclassified against the *whole shared remaining budget*, so on a
+    real repo with substantial classes in every layer, each group
+    force-included its own oversized first card regardless of how
+    little budget earlier groups had already used -- compounding to
+    ~2x the intended total on a real 94-file repository. Giving each
+    layer its own small pre-allocated slice up front (the fix; see
+    `_render_component_classes`) bounds this to at most one oversized
+    card *per layer* against *that layer's own small share*, not one
+    oversized card per layer against the full pool each time.
     """
     def big_class(name: str, annotation: str) -> str:
         fields = "\n".join(f"private String field{j};" for j in range(15))
@@ -125,12 +134,79 @@ def test_component_classes_budget_is_not_compounded_across_layer_groups():
     tight_budget = 1200  # smaller than a single one of these classes' rendered card
     ctx = _context(sources, max_detail_chars=tight_budget)
     prompt = build_architecture_prompt(ctx)
-
-    # Extract just the "Supporting per-class detail" section (it runs up
-    # to the "---" separator before the instructions) to measure its
-    # size in isolation from the rest of the prompt.
-    section = prompt.split("Supporting per-class detail")[1].split("\n---")[0]
-    # With the fix, at most one card total gets force-included past the
-    # tight budget; without it, up to three groups (API/Service/Data)
-    # would each force one in, multiplying the overshoot.
+    section = _component_classes_section(prompt)
     assert len(section) < tight_budget * 2
+
+
+def test_every_nonempty_layer_gets_representation_even_when_one_dominates():
+    """The actual bug this was designed to fix: a single class in one
+    layer (API) so large it alone would exhaust a naive shared budget
+    must not leave the other layers (Service, Data) with zero
+    representation -- the "Package E: 0 classes" scenario, just on the
+    layer axis instead of the package axis."""
+    def sized_class(name: str, annotation: str, n_fields: int) -> str:
+        fields = "\n".join(f"private String field{j};" for j in range(n_fields))
+        return f"{annotation} public class {name} {{ {fields} }}"
+
+    sources = {
+        "BigApi.java": sized_class("BigApi", "@RestController", 60),
+        "Svc1.java": sized_class("Svc1", "@Service", 2),
+        "Data1.java": sized_class("Data1", "@Repository", 2),
+    }
+    ctx = _context(sources, max_detail_chars=800)
+    prompt = build_architecture_prompt(ctx)
+    section = _component_classes_section(prompt)
+
+    assert "#### Service layer" in section and "Svc1" in section
+    assert "#### Data layer" in section and "Data1" in section
+
+
+def test_most_important_class_shown_first_when_layer_does_not_fully_fit():
+    """Within a layer whose classes don't all fit, the most central
+    class (highest fan-in) must be the one kept, not whichever happens
+    to sort first alphabetically."""
+    sources = {
+        "ZebraService.java": (  # alphabetically last, but heavily depended upon
+            "@Service public class ZebraService { public void run() {} }"
+        ),
+        "AardvarkService.java": (  # alphabetically first, but nothing depends on it
+            "@Service public class AardvarkService { private String note; }"
+        ),
+        "CallerA.java": "@Service public class CallerA { private ZebraService z; public void run() { z.run(); } }",
+        "CallerB.java": "@Service public class CallerB { private ZebraService z; public void run() { z.run(); } }",
+    }
+    ctx = _context(sources, max_detail_chars=200)  # tight enough that not everything fits
+    prompt = build_architecture_prompt(ctx)
+    section = _component_classes_section(prompt)
+    assert "ZebraService" in section
+
+
+def test_domain_model_shows_most_central_entities_first():
+    """When not every domain class fits, the ones other code actually
+    depends on should be shown before rarely-referenced ones -- not
+    whichever happens to sort first alphabetically."""
+    sources = {
+        "AardvarkDto.java": "@Entity public class AardvarkDto { private String note; }",  # alphabetically first, unreferenced
+        "Order.java": "@Entity public class Order { private String id; }",  # alphabetically last, heavily referenced
+        "UserA.java": "@Service public class UserA { private Order o; public void run() { }  }",
+        "UserB.java": "@Service public class UserB { private Order o; public void run() { } }",
+    }
+    ctx = _context(sources, max_detail_chars=250)  # tight enough that not both entities fit
+    prompt = build_architecture_prompt(ctx)
+    domain_section = prompt.split("Domain model")[1].split("Primary request flow")[0]
+    assert "Order" in domain_section
+    assert "AardvarkDto" not in domain_section
+
+
+def test_readme_top_classes_ranked_by_importance():
+    sources = {
+        "AardvarkUtil.java": "public class AardvarkUtil { public void doStuff() {} }",  # alphabetically first, unreferenced
+        "WidgetController.java": (
+            '@RestController public class WidgetController { @GetMapping("/w") public void get() {} }'
+        ),
+    }
+    ctx = _context(sources, max_detail_chars=200)  # tight enough that not both fit
+    prompt = build_readme_prompt(ctx)
+    types_section = prompt.split("Representative public types:")[1]
+    assert "WidgetController" in types_section
+    assert "AardvarkUtil" not in types_section

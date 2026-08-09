@@ -7,7 +7,7 @@ LLM only ever sees the shape of the code, not its implementation.
 """
 from __future__ import annotations
 
-from repobrain.docgen.context import ClassCard, ProjectContext
+from repobrain.docgen.context import ClassCard, ProjectContext, select_with_group_coverage
 
 SYSTEM_PROMPT = (
     "You are a senior software engineer writing technical documentation "
@@ -144,7 +144,8 @@ def _render_domain_model(ctx: ProjectContext) -> str:
             "or data-carrying shape (a class/record with instance fields, or an enum)."
         )
     lines = ["Business/domain concepts (the nouns this system deals with), with their fields:"]
-    shown = domain_cards[:_MAX_DOMAIN_CLASSES_SHOWN]
+    ranked = sorted(domain_cards, key=lambda c: (-c.importance, c.qualified_name))
+    shown = ranked[:_MAX_DOMAIN_CLASSES_SHOWN]
     for card in shown:
         fields = card.fields[:_MAX_DOMAIN_FIELDS_SHOWN]
         field_list = "; ".join(fields) if fields else "no fields"
@@ -175,41 +176,22 @@ def _render_component_classes(ctx: ProjectContext, budget: int) -> str:
     class as well would just duplicate that section, and domain types
     are typically the most numerous class of type in any real codebase.
 
-    `budget` bounds this section specifically (see `build_architecture_prompt`,
-    which carves it out of `ctx.max_detail_chars` after accounting for
-    every other "verified fact" section) — it is *not* the same as the
-    budget originally used to decide how many classes made it into
-    `ctx` at all; a repo that already exceeded that first budget can
-    still exceed this second, smaller one, hence the explicit tracking
-    of omitted classes here too.
+    Selection is `select_with_group_coverage` — the same mechanism
+    `build_project_context` uses for its own, earlier, wider-budget pass
+    — so a layer that already survived that first pass can't be silently
+    zeroed out by this second, tighter one specific to ARCHITECTURE.md
+    (see `build_architecture_prompt`, which carves `budget` out of
+    `ctx.max_detail_chars` after accounting for every other "verified
+    fact" section). Both passes being layer-coverage-aware is what
+    actually closes the gap: a single layer-blind pass anywhere in the
+    pipeline can starve a layer in a way no later pass can recover from.
     """
     groups = [(label, ctx.classes_by_layer(layer)) for layer, label in (("api", "API"), ("service", "Service"), ("data", "Data"))]
     groups.append(("Unclassified", [c for c in ctx.all_class_cards() if c.layer is None]))
 
-    sections = []
-    remaining = budget
-    omitted_total = 0
-    rendered_anything = False
-    for label, cards in groups:
-        if not cards:
-            continue
-        if remaining <= 0:
-            omitted_total += len(cards)
-            continue
-        rendered = [c.render() for c in cards]
-        # Only the very first group overall is allowed to force-include
-        # its first card when it alone exceeds the remaining budget —
-        # applying that guarantee independently to *every* group is what
-        # let this section blow past its budget by ~2x on a real repo:
-        # each of API/Service/Data/Unclassified force-adding one
-        # (possibly large) card regardless of how little budget was left.
-        text, used, kept_count = _fit_items_to_budget(rendered, remaining, force_first=not rendered_anything)
-        if text:
-            sections.append(f"#### {label} layer\n\n{text}")
-            remaining -= used
-            rendered_anything = True
-        omitted_total += len(cards) - kept_count
+    kept_by_label, omitted_total = select_with_group_coverage(groups, budget)
 
+    sections = [f"#### {label} layer\n\n{_render_cards(cards)}" for label, cards in kept_by_label.items()]
     result = "\n\n".join(sections)
     if omitted_total:
         result += f"\n\n... and {omitted_total} more classes not shown in detail due to prompt size limits"
@@ -224,7 +206,8 @@ def build_readme_prompt(ctx: ProjectContext) -> str:
     # are, using a fraction of the shared detail budget (README's other
     # sections are small and fixed, so this doesn't need the same
     # extras-first accounting ARCHITECTURE.md's prompt does).
-    top_classes = [c for c in ctx.all_class_cards() if "public" in c.modifiers][:25]
+    public_classes = [c for c in ctx.all_class_cards() if "public" in c.modifiers]
+    top_classes = sorted(public_classes, key=lambda c: (-c.importance, c.qualified_name))[:25]
     rendered = [c.render(include_dependencies=False) for c in top_classes]
     class_text, _, kept_count = _fit_items_to_budget(rendered, ctx.max_detail_chars // 2)
     if len(rendered) > kept_count:
